@@ -174,3 +174,7 @@ def main():
     print(f"TOTAL positive pairs: {len(all_positive)}")
     print(f"TOTAL negative pairs: {len(all_negative)}")
     print(f"manifest written to {MANIFEST_PATH}")
+
+
+if __name__ == "__main__":
+    main()
