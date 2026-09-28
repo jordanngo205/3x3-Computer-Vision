@@ -148,6 +148,9 @@ def main():
     p.add_argument("--all-cameras", action="store_true",
                    help="process every frame, including shots from other cameras the calibration "
                         "does not apply to")
+    p.add_argument("--device", default="mps",
+                   help="torch device. Ultralytics was silently choosing CPU on this machine, "
+                        "which is 2.5x slower than MPS for the same result.")
     p.add_argument("--tracker", default="botsort.yaml",
                    help="ultralytics tracker config. BoT-SORT uses motion prediction and global "
                         "motion compensation for the panning camera, so a player keeps one id "
@@ -219,10 +222,12 @@ def main():
             fi += 1
             continue
         if args.greedy_link:
-            res = model(frame, conf=args.conf, iou=0.85, imgsz=args.imgsz, verbose=False)[0]
+            res = model(frame, conf=args.conf, iou=0.85, imgsz=args.imgsz,
+                        device=args.device, verbose=False)[0]
         else:
             res = model.track(frame, conf=args.conf, iou=0.85, imgsz=args.imgsz,
-                              tracker=args.tracker, persist=True, verbose=False)[0]
+                              device=args.device, tracker=args.tracker, persist=True,
+                              verbose=False)[0]
         boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else np.empty((0, 4))
         kps = res.keypoints.data.cpu().numpy() if res.keypoints is not None else None
         # BoT-SORT gives an id per detection; it is None before the tracker has
