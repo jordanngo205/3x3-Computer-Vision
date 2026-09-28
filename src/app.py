@@ -352,3 +352,172 @@ def write_events(slug: str, rows: List[Dict[str, str]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def append_event(slug: str, row: Dict[str, str]) -> None:
+    rows = read_events(slug)
+    rows.append(row)
+    write_events(slug, rows)
+
+
+def read_projected_rows(slug: str) -> List[Dict[str, str]]:
+    path = profile_paths(ROOT, slug)["projected_shots"]
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def build_review_rows(profile: Dict[str, Any], projected_rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    frame_width = float(profile.get("width") or 1.0)
+    frame_height = float(profile.get("height") or 1.0)
+    court_width, court_height = court_image_size(CHART_SCALE, CHART_MARGIN)
+    review_rows: List[Dict[str, Any]] = []
+
+    for index, row in enumerate(projected_rows, start=1):
+        frame_x = float(row.get("pixel_x") or 0.0)
+        frame_y = float(row.get("pixel_y") or 0.0)
+        court_x = float(row.get("court_x_ft") or 0.0)
+        court_y = float(row.get("court_y_ft") or 0.0)
+        court_px_x, court_px_y = feet_to_pixels((court_x, court_y), CHART_SCALE, CHART_MARGIN)
+        result = (row.get("result") or "").strip().lower()
+
+        review_row: Dict[str, Any] = dict(row)
+        review_row["event_number"] = index
+        review_row["has_projection"] = bool(row.get("court_x_ft")) and bool(row.get("court_y_ft"))
+        review_row["frame_left_pct"] = (frame_x / frame_width) * 100.0
+        review_row["frame_top_pct"] = (frame_y / frame_height) * 100.0
+        review_row["court_left_pct"] = (court_px_x / court_width) * 100.0
+        review_row["court_top_pct"] = (court_px_y / court_height) * 100.0
+        review_row["marker_class"] = "make" if result in {"make", "made", "1", "true", "yes"} else "miss"
+        timestamp_s = parse_event_timestamp(row.get("timestamp"))
+        if timestamp_s is not None:
+            clip_start_s = max(0.0, timestamp_s - REVIEW_CLIP_BEFORE_S)
+            clip_end_s = timestamp_s + REVIEW_CLIP_AFTER_S
+            duration_s = float(profile.get("duration_seconds") or 0.0)
+            if duration_s > 0:
+                clip_end_s = min(duration_s, clip_end_s)
+            review_row["clip_start_s"] = clip_start_s
+            review_row["clip_end_s"] = clip_end_s
+            review_row["event_timestamp_s"] = timestamp_s
+
+            try:
+                review_frames = ensure_review_frames(profile, index, timestamp_s)
+            except RuntimeError:
+                review_frames = []
+            if review_frames:
+                review_row["review_frames"] = review_frames
+                review_gif_path = ensure_review_gif(profile, index, timestamp_s, review_frames)
+                if review_gif_path:
+                    review_row["review_gif_path"] = review_gif_path
+        review_rows.append(review_row)
+
+    return review_rows
+
+
+def run_pipeline(slug: str) -> None:
+    paths = profile_paths(ROOT, slug)
+    calibration_path = paths["calibration"]
+    events_path = paths["events"]
+    if not calibration_path.exists():
+        raise RuntimeError("Save a calibration first.")
+    if not events_path.exists():
+        raise RuntimeError("Add at least one event first.")
+
+    commands = [
+        [
+            sys.executable,
+            str(ROOT / "src" / "compute_calibration.py"),
+            "--config",
+            str(calibration_path),
+            "--out",
+            str(paths["calibration_matrix"]),
+        ],
+        [
+            sys.executable,
+            str(ROOT / "src" / "project_events.py"),
+            "--events",
+            str(events_path),
+            "--calibration",
+            str(paths["calibration_matrix"]),
+            "--out",
+            str(paths["projected_shots"]),
+        ],
+        [
+            sys.executable,
+            str(ROOT / "src" / "render_shot_chart.py"),
+            "--events",
+            str(paths["projected_shots"]),
+            "--out",
+            str(paths["shot_chart"]),
+        ],
+    ]
+
+    for command in commands:
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "Pipeline step timed out. Recheck the calibration points and try a cleaner frame."
+            ) from exc
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or completed.stdout.strip() or "Unknown pipeline error."
+            raise RuntimeError(message)
+
+
+@app.route("/")
+def index():
+    videos = list_cached_profiles(ROOT)
+    if not videos:
+        videos = build_video_library(ROOT)
+    return render_template("index.html", videos=videos)
+
+
+@app.post("/rescan")
+def rescan():
+    build_video_library(ROOT, refresh=True)
+    flash("Video library refreshed.")
+    return redirect(url_for("index"))
+
+
+@app.route("/media/<path:relpath>")
+def media(relpath: str):
+    return send_file(ROOT / relpath)
+
+
+@app.route("/videos/<slug>")
+def video_detail(slug: str):
+    profile = refresh_profile_status(ROOT, slug)
+    return render_template("video_detail.html", profile=profile)
+
+
+@app.route("/videos/<slug>/calibration", methods=["GET", "POST"])
+def calibration(slug: str):
+    profile = refresh_profile_status(ROOT, slug)
+    paths = profile_paths(ROOT, slug)
+
+    if request.method == "POST":
+        landmarks_json = request.form.get("landmarks_json", "").strip()
+        try:
+            landmarks = json.loads(landmarks_json) if landmarks_json else {}
+        except json.JSONDecodeError as exc:
+            flash(f"Invalid landmark JSON: {exc}")
+            return redirect(url_for("calibration", slug=slug))
+
+        payload = {
+            "video": profile["video_name"],
+            "frame_image": request.form.get("frame_image", profile["sample_frames"][0] if profile["sample_frames"] else ""),
+            "landmarks_px": landmarks,
+        }
+        write_json(paths["calibration"], payload)
+        refresh_profile_status(ROOT, slug)
+        flash("Calibration saved.")
+        return redirect(url_for("calibration", slug=slug))
+
+    calibration_payload = load_calibration(slug, profile)
+    return render_template(
+        "calibration.html",
+        profile=profile,
+        calibration=calibration_payload,
+        landmark_names=list(load_landmark_names()),
+    )
