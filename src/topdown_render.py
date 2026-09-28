@@ -131,6 +131,81 @@ def team_of(frame, box):
     return "C" if col > wht else "W"
 
 
+def merge_fragments(detections, fps, max_gap_seconds=0.4, max_dist_cm=300.0,
+                    max_speed_cms=900.0):
+    """Rejoin the tracks that are one player broken in two.
+
+    BoT-SORT opens a new id when a player is occluded and reappears: on this
+    clip, 89 ids for six players over 38 seconds. Each fragment then gets its
+    kit decided on its own evidence, so a player can change colour at the break
+    - which is exactly the "the red disappeared and popped up over there"
+    behaviour, and no amount of per-track purity can fix it, because the
+    fragments really are different tracks.
+
+    Two fragments can only be the same player if they never appear in the same
+    frame (one person is not in two places), the gap between them is short, and
+    the distance across that gap is something a player could cover in the time.
+    Merge the closest pairs first, and re-check after each merge so a chain
+    cannot quietly join two players who do overlap.
+    """
+    span, pts = {}, {}
+    for f, ds in detections.items():
+        for d in ds:
+            t = d.get("tid")
+            if t is None:
+                continue
+            a, b = span.get(t, (f, f))
+            span[t] = (min(a, f), max(b, f))
+            pts.setdefault(t, {})[f] = (d["cx"], d["cy"])
+    if not span:
+        return 0
+
+    parent = {t: t for t in span}
+    def find(t):
+        while parent[t] != t:
+            parent[t] = parent[parent[t]]
+            t = parent[t]
+        return t
+
+    frames_of = {t: set(v) for t, v in pts.items()}
+    max_gap = max(1, int(round(max_gap_seconds * fps)))
+
+    cands = []
+    for a in span:
+        for b in span:
+            if a == b:
+                continue
+            gap = span[b][0] - span[a][1]          # b starts after a ends
+            if not (0 < gap <= max_gap):
+                continue
+            pa = pts[a][span[a][1]]
+            pb = pts[b][span[b][0]]
+            dist = ((pa[0]-pb[0])**2 + (pa[1]-pb[1])**2) ** 0.5
+            if dist > max_dist_cm or dist > max_speed_cms * gap / fps:
+                continue
+            cands.append((dist, gap, a, b))
+    cands.sort()
+
+    merged = 0
+    for dist, gap, a, b in cands:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            continue
+        if frames_of[ra] & frames_of[rb]:          # seen together: two people
+            continue
+        parent[rb] = ra
+        frames_of[ra] |= frames_of[rb]
+        merged += 1
+
+    for f, ds in detections.items():
+        for d in ds:
+            if d.get("tid") is not None:
+                d["tid"] = find(d["tid"])
+    print(f"tracklet merge: {len(span)} fragments -> {len(span) - merged} tracks "
+          f"({merged} rejoined)")
+    return merged
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--video", required=True)
@@ -158,6 +233,10 @@ def main():
                         "read if present. Detection and tracking are the expensive part and do not "
                         "depend on the team logic, so caching them turns a 1-hour experiment on the "
                         "labelling into a 1-second one.")
+    p.add_argument("--no-merge-fragments", action="store_true",
+                   help="skip rejoining BoT-SORT fragments that are the same player")
+    p.add_argument("--merge-gap-seconds", type=float, default=0.4)
+    p.add_argument("--merge-dist-cm", type=float, default=300.0)
     p.add_argument("--tracker", default="botsort.yaml",
                    help="ultralytics tracker config. BoT-SORT uses motion prediction and global "
                         "motion compensation for the panning camera, so a player keeps one id "
@@ -321,6 +400,9 @@ def main():
             pickle.dump({"detections": detections, "n_refs": n_refs[0],
                          "on_court_total": on_court_total, "n_frames": fi}, fh)
         print(f"cached detections -> {cache}")
+
+    if not args.no_merge_fragments:
+        merge_fragments(detections, fps, args.merge_gap_seconds, args.merge_dist_cm)
 
     # smooth each track's court position over a short window. A single frame's
     # ankle keypoints jitter by a few pixels, and the homography turns that into
