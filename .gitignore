@@ -1,0 +1,30 @@
+# Source footage and model weights: large, re-downloadable, or not ours to publish
+*.mov
+*.mp4
+!TOPDOWN_LONG11.mp4
+*.pt
+*.onnx
+
+# Derived output - regenerate by running the pipeline
+positions_*.json
+gravity_*.json
+output_*
+video_*.mp4
+clip01_*
+realtest_*
+*_small.mp4
+cache_*.pkl
+*.pkl
+review_images/
+clip_results/
+pseudo_labels/
+same_game_clips/
+frames/
+
+# Environment
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.Rapp.history
+tesi.pdf
