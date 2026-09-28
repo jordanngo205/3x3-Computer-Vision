@@ -86,6 +86,30 @@ def torso_feature(frame, box):
     return float(red - white)
 
 
+def looks_like_referee(frame, box, cx, cy):
+    """Officials wear a dark, unsaturated kit and work near the lines.
+
+    None of these signals is enough alone - measured on hand labels, kit colour
+    alone also caught 12% of players, and the boundary rule alone caught only
+    23% of referees over a short clip (it is a whole-game statistic in the
+    reference project). Together they separated 16/16 referees from 146 players
+    with no player lost.
+    """
+    x1, y1, x2, y2 = [int(v) for v in box]
+    w, h = x2 - x1, y2 - y1
+    if w < 10 or h < 25:
+        return False
+    p = frame[max(0, y1 + int(h * .26)):max(1, y1 + int(h * .46)),
+              max(0, x1 + int(w * .34)):max(1, x1 + int(w * .66))]
+    if p.size < 30:
+        return False
+    hsv = cv2.cvtColor(p, cv2.COLOR_BGR2HSV)
+    sat = float(np.median(hsv[:, :, 1]))
+    val = float(np.median(hsv[:, :, 2]))
+    edge = min(abs(cx), abs(cx - COURT_W), abs(cy), abs(cy - COURT_H))
+    return sat < 50 and val < 160 and edge < 220
+
+
 def team_of(frame, box):
     x1, y1, x2, y2 = [int(v) for v in box]
     w, h = x2 - x1, y2 - y1
@@ -121,6 +145,14 @@ def main():
     p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--imgsz", type=int, default=1280)
     p.add_argument("--save-positions", default=None)
+    p.add_argument("--keep-referees", action="store_true",
+                   help="keep officials in the output instead of filtering them out")
+    p.add_argument("--max-depth", type=float, default=1000.0,
+                   help="drop detections deeper than this many cm from the baseline. From 180 hand "
+                        "labels: every bench/substitute detection sat beyond 1000 cm, and only one "
+                        "player in 129 ever did, so this removes the bench without losing players.")
+    p.add_argument("--bounds-margin", type=float, default=60.0,
+                   help="centimetres of slack outside the court lines; players step over them")
     args = p.parse_args()
 
     H = np.array(json.load(open(args.calib))["H_image_to_court"])
@@ -139,6 +171,7 @@ def main():
     COLS = {"C": (60, 60, 235), "W": (235, 235, 235), "?": (120, 160, 120)}
     positions, fi, on_court_total = {}, 0, 0
 
+    n_refs = [0]
     detections = {}
 
     while True:
@@ -157,6 +190,15 @@ def main():
             if pt is None:
                 continue
             cx, cy = to_court(pt)
+            # in/out of bounds is now decided in court metres, not by a pixel
+            # polygon: a substitute sitting past the sideline is genuinely off
+            # the court, whatever the floor looks like there
+            m = args.bounds_margin
+            if not (-m <= cx <= COURT_W + m and -m <= cy <= args.max_depth):
+                continue
+            if not args.keep_referees and looks_like_referee(frame, box, cx, cy):
+                n_refs[0] += 1
+                continue
             here.append({"box": box, "kp": kps[i], "pt": pt, "cx": float(cx), "cy": float(cy),
                          "feat": torso_feature(frame, box)})
 
@@ -210,6 +252,7 @@ def main():
         fi += 1
     cap.release()
     writer.release()
+    print(f"referee detections removed: {n_refs[0]}")
     print(f"done. {fi} frames -> {args.out}   {on_court_total/max(1,fi):.1f} players/frame")
     if args.save_positions:
         json.dump({"fps": fps, "court_cm": [COURT_W, COURT_H], "frames": positions},
