@@ -18,6 +18,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from pose_detect import EDGES
+from track_botsort import detect_shots
 
 COURT_W, COURT_H = 1500.0, 1100.0
 PAD, SCALE = 40, 0.42          # top-down canvas: cm -> px
@@ -145,6 +146,9 @@ def main():
     p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--imgsz", type=int, default=1280)
     p.add_argument("--save-positions", default=None)
+    p.add_argument("--all-cameras", action="store_true",
+                   help="process every frame, including shots from other cameras the calibration "
+                        "does not apply to")
     p.add_argument("--keep-referees", action="store_true",
                    help="keep officials in the output instead of filtering them out")
     p.add_argument("--max-depth", type=float, default=1000.0,
@@ -157,6 +161,20 @@ def main():
 
     H = np.array(json.load(open(args.calib))["H_image_to_court"])
     model = YOLO(args.model)
+
+    # The calibration belongs to one camera. Broadcast clips cut to zoomed and
+    # low-angle cameras, where the same homography points at meaningless pixels
+    # and every position is wrong. Keep only the shots that match the framing we
+    # calibrated on.
+    wide_frames = None
+    if not args.all_cameras:
+        shots, wide = detect_shots(args.video)
+        wide_frames = set()
+        for a, b in wide:
+            wide_frames.update(range(a, b))
+        skipped = sum(b - a for a, b in shots) - len(wide_frames)
+        print(f"camera shots: {len(shots)} total, {len(wide)} match the calibrated view "
+              f"({skipped} frames from other cameras will be skipped)")
 
     def to_court(pt):
         return cv2.perspectiveTransform(np.array([[pt]], dtype=np.float32), H).reshape(2)
@@ -178,6 +196,10 @@ def main():
         ok, frame = cap.read()
         if not ok:
             break
+        if wide_frames is not None and fi not in wide_frames:
+            detections[fi] = []
+            fi += 1
+            continue
         res = model(frame, conf=args.conf, iou=0.85, imgsz=args.imgsz, verbose=False)[0]
         boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else np.empty((0, 4))
         kps = res.keypoints.data.cpu().numpy() if res.keypoints is not None else None
