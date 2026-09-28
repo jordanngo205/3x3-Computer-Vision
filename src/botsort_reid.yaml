@@ -1,0 +1,21 @@
+# BoT-SORT with ReID enabled, tuned for 3x3 basketball broadcast.
+# Mirrors the tracker family TrackID3x3 (arXiv:2503.18282) uses as its baseline.
+tracker_type: botsort
+
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.35   # raised: a genuinely new player is rare mid-clip, and a
+                         # lower bar mostly manufactures duplicate ids during contact
+track_buffer: 60         # ~1s at 57fps: long enough to survive a screen, since a
+                         # track that dies mid-occlusion can never be recovered
+match_thresh: 0.8
+fuse_score: True
+
+gmc_method: sparseOptFlow  # camera pans on this footage; without compensation every
+                           # player shifts at once and association degrades together
+
+with_reid: True          # the whole point of this rewrite - identity from a ReID
+                         # model rather than our own failed embedding
+model: auto
+proximity_thresh: 0.5
+appearance_thresh: 0.8
