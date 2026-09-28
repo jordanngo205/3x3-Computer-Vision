@@ -206,6 +206,83 @@ def merge_fragments(detections, fps, max_gap_seconds=0.4, max_dist_cm=300.0,
     return merged
 
 
+def assign_teams_global(detections, split, lam_scale=1.0, iters=40):
+    """Settle each track on one kit, with the 3-on-3 rule coupling the tracks.
+
+    Deciding each frame on its own throws away the strongest evidence available:
+    BoT-SORT follows one player for hundreds of frames, and that whole run is
+    one person in one kit. Per-frame ranking can hand the same track red in one
+    frame and white in the next, which is physically impossible.
+
+    (The obvious alternative - "team-mates cluster on the same half" - does not
+    exist in 3x3: it is a half court with a single basket, and both teams attack
+    it. So the geometry available here is the roster count, not the side.)
+
+    So label the TRACK, paying:
+      - a colour cost, how far each of its detections sits on the wrong side of
+        the kit split, summed over the track's life; and
+      - a constraint cost, lam per player of imbalance in every frame that has
+        six players in it, where the split must be 3/3.
+
+    Minimised by coordinate descent from the colour-only labelling: flip the
+    single track that most reduces the total, repeat until nothing improves.
+    Colour decides the tracks it can see clearly; the 3/3 rule decides the ones
+    it cannot.
+    """
+    tracks = {}
+    for f, ds in detections.items():
+        for d in ds:
+            if d.get("feat") is not None and d.get("tid") is not None:
+                tracks.setdefault(d["tid"], []).append(d["feat"])
+    if not tracks:
+        return {}
+
+    ids = sorted(tracks)
+    cost = {
+        "C": {t: float(sum(max(0.0, split - v) for v in vs)) for t, vs in tracks.items()},
+        "W": {t: float(sum(max(0.0, v - split) for v in vs)) for t, vs in tracks.items()},
+    }
+    label = {t: ("C" if cost["C"][t] <= cost["W"][t] else "W") for t in ids}
+
+    # scale the constraint against how strong the colour evidence actually is in
+    # this clip, so one lambda works on footage with different lighting
+    spread = float(np.median([abs(v - split) for vs in tracks.values() for v in vs])) or 1.0
+    lam = lam_scale * spread
+
+    frame_tracks = {}
+    for f, ds in detections.items():
+        ts = [d["tid"] for d in ds if d.get("feat") is not None and d.get("tid") is not None]
+        if len(ts) == 6 and len(set(ts)) == 6:
+            frame_tracks[f] = ts
+    where = {}
+    for f, ts in frame_tracks.items():
+        for t in ts:
+            where.setdefault(t, []).append(f)
+    n_c = {f: sum(1 for t in ts if label[t] == "C") for f, ts in frame_tracks.items()}
+
+    for _ in range(iters):
+        changed = 0
+        for t in ids:
+            cur = label[t]
+            new = "W" if cur == "C" else "C"
+            delta = cost[new][t] - cost[cur][t]
+            step = 1 if new == "C" else -1
+            for f in where.get(t, []):
+                delta += lam * (abs(n_c[f] + step - 3) - abs(n_c[f] - 3))
+            if delta < -1e-9:
+                label[t] = new
+                for f in where.get(t, []):
+                    n_c[f] += step
+                changed += 1
+        if not changed:
+            break
+
+    bad = sum(1 for f in frame_tracks if n_c[f] != 3)
+    print(f"global team assignment: {len(ids)} tracks, {len(frame_tracks)} six-player frames, "
+          f"{bad} still not 3/3")
+    return label
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--video", required=True)
@@ -237,6 +314,12 @@ def main():
                    help="skip rejoining BoT-SORT fragments that are the same player")
     p.add_argument("--merge-gap-seconds", type=float, default=0.4)
     p.add_argument("--merge-dist-cm", type=float, default=300.0)
+    p.add_argument("--per-frame-team", action="store_true",
+                   help="decide the kits frame by frame (the old way) instead of settling each "
+                        "BoT-SORT track on one kit under the 3-on-3 constraint")
+    p.add_argument("--team-lambda", type=float, default=1.0,
+                   help="how hard to push a six-player frame towards a 3/3 split, relative to the "
+                        "strength of the colour evidence in this clip")
     p.add_argument("--tracker", default="botsort.yaml",
                    help="ultralytics tracker config. BoT-SORT uses motion prediction and global "
                         "motion compensation for the panning camera, so a player keeps one id "
@@ -499,32 +582,39 @@ def main():
     # threshold, because it only needs the ORDER to be right, not the absolute
     # score - and the order survives lighting changes that move every score at
     # once.
-    per_track = {}
-    for f, ds in detections.items():
-        scored = [d for d in ds if d.get("feat") is not None]
-        if len(scored) == 6:
-            order = sorted(scored, key=lambda d: -d["feat"])
-            for i, d in enumerate(order):
-                d["team"] = "C" if i < 3 else "W"
-        else:
-            for d in ds:
-                sc = d.get("feat")
-                if sc is None:
-                    d["team"] = "?"
-                    continue
-                d["team"] = "C" if sc > split + band else ("W" if sc < split - band else "?")
-        for d in ds:
-            if d.get("team") in ("C", "W"):
-                per_track.setdefault(d.get("tid"), []).append(d["team"])
-    settled = {}
-    for tid, labs in per_track.items():
-        c, w = labs.count("C"), labs.count("W")
-        settled[tid] = "C" if c > w else ("W" if w > c else "?")
-    if not args.no_track_vote:
+    if not args.per_frame_team:
+        # one kit per track, chosen so the 3/3 rule holds across the whole clip
+        label = assign_teams_global(detections, split, args.team_lambda)
         for f, ds in detections.items():
             for d in ds:
-                if d.get("tid") in settled:
-                    d["team"] = settled[d["tid"]]
+                d["team"] = label.get(d.get("tid"), "?") if d.get("feat") is not None else "?"
+    else:
+        per_track = {}
+        for f, ds in detections.items():
+            scored = [d for d in ds if d.get("feat") is not None]
+            if len(scored) == 6:
+                order = sorted(scored, key=lambda d: -d["feat"])
+                for i, d in enumerate(order):
+                    d["team"] = "C" if i < 3 else "W"
+            else:
+                for d in ds:
+                    sc = d.get("feat")
+                    if sc is None:
+                        d["team"] = "?"
+                        continue
+                    d["team"] = "C" if sc > split + band else ("W" if sc < split - band else "?")
+            for d in ds:
+                if d.get("team") in ("C", "W"):
+                    per_track.setdefault(d.get("tid"), []).append(d["team"])
+        settled = {}
+        for tid, labs in per_track.items():
+            c, w = labs.count("C"), labs.count("W")
+            settled[tid] = "C" if c > w else ("W" if w > c else "?")
+        if not args.no_track_vote:
+            for f, ds in detections.items():
+                for d in ds:
+                    if d.get("tid") in settled:
+                        d["team"] = settled[d["tid"]]
 
     n_c = sum(1 for ds in detections.values() for d in ds if d.get("team") == "C")
     n_w = sum(1 for ds in detections.values() for d in ds if d.get("team") == "W")
