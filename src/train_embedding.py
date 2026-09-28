@@ -178,3 +178,7 @@ def main():
             torch.save({"model_state": model.state_dict(), "embed_dim": EMBED_DIM, "img_size": (IMG_H, IMG_W)}, args.checkpoint)
 
     print(f"best val_loss {best_val_loss:.4f}, checkpoint saved to {args.checkpoint}")
+
+
+if __name__ == "__main__":
+    main()
