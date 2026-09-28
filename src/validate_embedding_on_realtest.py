@@ -112,3 +112,7 @@ def main():
     new_pos = [dist_fn(a, b) for a, b in pos_pairs]
     new_neg = [dist_fn(a, b) for a, b in neg_pairs]
     summarize("trained embedding (held out, never trained on this half)", new_pos, new_neg)
+
+
+if __name__ == "__main__":
+    main()
