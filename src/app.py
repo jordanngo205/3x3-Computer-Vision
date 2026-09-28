@@ -521,3 +521,142 @@ def calibration(slug: str):
         calibration=calibration_payload,
         landmark_names=list(load_landmark_names()),
     )
+
+
+@app.post("/videos/<slug>/auto-calibration")
+def auto_calibration(slug: str):
+    profile = refresh_profile_status(ROOT, slug)
+    try:
+        try_auto_calibration(slug, profile)
+        refresh_profile_status(ROOT, slug)
+        flash("Auto calibration saved.")
+    except RuntimeError as exc:
+        flash(str(exc))
+    return redirect(url_for("calibration", slug=slug))
+
+
+@app.route("/videos/<slug>/candidates")
+def candidates(slug: str):
+    profile = refresh_profile_status(ROOT, slug)
+    paths = profile_paths(ROOT, slug)
+    candidate_rows = read_candidate_rows(paths["shot_candidates"])
+    calibration_matrix = read_json(paths["calibration_matrix"]) if paths["calibration_matrix"].exists() else None
+    return render_template(
+        "candidates.html",
+        profile=profile,
+        candidate_rows=candidate_rows,
+        review_rows=build_review_rows(profile, candidate_rows),
+        calibration_matrix=calibration_matrix,
+        court_reference_path=ensure_clean_court_reference(),
+    )
+
+
+@app.post("/videos/<slug>/candidates/mine")
+def mine_candidates(slug: str):
+    profile = refresh_profile_status(ROOT, slug)
+    paths = profile_paths(ROOT, slug)
+    try:
+        rows = mine_shot_candidates(
+            root=ROOT,
+            video_path=ROOT / str(profile["video_path"]),
+            duration_s=float(profile.get("duration_seconds") or 0.0),
+            out_csv=paths["shot_candidates"],
+            frame_dir=paths["candidate_frames_dir"],
+            calibration_matrix_path=paths["calibration_matrix"] if paths["calibration_matrix"].exists() else None,
+        )
+        refresh_profile_status(ROOT, slug)
+        flash(f"Mined {len(rows)} shot candidates.")
+    except RuntimeError as exc:
+        flash(str(exc))
+    return redirect(url_for("candidates", slug=slug))
+
+
+@app.post("/videos/<slug>/candidates/promote")
+def promote_candidates(slug: str):
+    paths = profile_paths(ROOT, slug)
+    candidate_rows = read_candidate_rows(paths["shot_candidates"])
+    if not candidate_rows:
+        flash("Mine candidates first.")
+        return redirect(url_for("candidates", slug=slug))
+
+    write_events(slug, candidate_rows_to_events(candidate_rows))
+    refresh_profile_status(ROOT, slug)
+
+    if paths["calibration"].exists():
+        try:
+            run_pipeline(slug)
+            refresh_profile_status(ROOT, slug)
+            flash("Candidates replaced the manual events and outputs were rebuilt.")
+            return redirect(url_for("results", slug=slug))
+        except RuntimeError as exc:
+            flash(f"Candidates saved as events, but the outputs build failed: {exc}")
+            return redirect(url_for("events", slug=slug))
+
+    flash("Candidates replaced the manual events.")
+    return redirect(url_for("events", slug=slug))
+
+
+@app.route("/videos/<slug>/events", methods=["GET", "POST"])
+def events(slug: str):
+    profile = refresh_profile_status(ROOT, slug)
+
+    if request.method == "POST":
+        row = {
+            "timestamp": request.form.get("timestamp", "").strip(),
+            "frame_image": request.form.get("frame_image", "").strip(),
+            "label": request.form.get("label", "").strip(),
+            "pixel_x": request.form.get("pixel_x", "").strip(),
+            "pixel_y": request.form.get("pixel_y", "").strip(),
+            "result": request.form.get("result", "").strip(),
+            "play_type": request.form.get("play_type", "").strip(),
+            "notes": request.form.get("notes", "").strip(),
+        }
+        if not row["pixel_x"] or not row["pixel_y"]:
+            flash("Click the frame to set pixel coordinates before saving.")
+            return redirect(url_for("events", slug=slug))
+        append_event(slug, row)
+        refresh_profile_status(ROOT, slug)
+        flash("Event saved.")
+        return redirect(url_for("events", slug=slug))
+
+    return render_template(
+        "events.html",
+        profile=profile,
+        events=read_events(slug),
+        play_types=PLAY_TYPES,
+    )
+
+
+@app.post("/videos/<slug>/events/reset")
+def reset_events(slug: str):
+    write_events(slug, [])
+    refresh_profile_status(ROOT, slug)
+    flash("Events cleared.")
+    return redirect(url_for("events", slug=slug))
+
+
+@app.post("/videos/<slug>/build")
+def build_outputs(slug: str):
+    try:
+        run_pipeline(slug)
+        refresh_profile_status(ROOT, slug)
+        flash("Shot coordinates and chart generated.")
+    except RuntimeError as exc:
+        flash(str(exc))
+    return redirect(url_for("results", slug=slug))
+
+
+@app.route("/videos/<slug>/results")
+def results(slug: str):
+    profile = refresh_profile_status(ROOT, slug)
+    paths = profile_paths(ROOT, slug)
+    calibration_matrix = read_json(paths["calibration_matrix"]) if paths["calibration_matrix"].exists() else None
+    projected_rows = read_projected_rows(slug)
+    return render_template(
+        "results.html",
+        profile=profile,
+        projected_rows=projected_rows,
+        review_rows=build_review_rows(profile, projected_rows),
+        calibration_matrix=calibration_matrix,
+        court_reference_path=ensure_clean_court_reference(),
+    )
