@@ -28,3 +28,7 @@ __pycache__/
 .DS_Store
 .Rapp.history
 tesi.pdf
+
+# scratch
+src/scratch_crops/
+*.bak
