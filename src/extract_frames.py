@@ -148,3 +148,7 @@ def main() -> None:
         metadata_out.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
     print(json.dumps(metadata, indent=2))
+
+
+if __name__ == "__main__":
+    main()
