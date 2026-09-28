@@ -250,3 +250,350 @@ def box_iou(a, b):
     inter = (x2-x1) * (y2-y1)
     area_a = (a[2]-a[0]) * (a[3]-a[1]); area_b = (b[2]-b[0]) * (b[3]-b[1])
     return inter / (area_a + area_b - inter)
+
+model = YOLO('/Users/jordanngo/Projects/AI live tracking/yolo11n.pt')
+
+cap = cv2.VideoCapture(VIDEO)
+fps = cap.get(cv2.CAP_PROP_FPS)
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+RESIZE_SCALE = 1.0
+if args.max_width and w > args.max_width:
+    RESIZE_SCALE = args.max_width / w
+    w, h = args.max_width, round(h * RESIZE_SCALE)
+    if args.court_poly:
+        COURT_POLY = np.round(COURT_POLY * RESIZE_SCALE).astype(np.int32)
+    print(f'downscaling frames by {RESIZE_SCALE:.3f} -> {w}x{h}')
+
+frames = []
+while True:
+    ok, f = cap.read()
+    if not ok:
+        break
+    if RESIZE_SCALE != 1.0:
+        f = cv2.resize(f, (w, h), interpolation=cv2.INTER_AREA)
+    frames.append(f)
+cap.release()
+print('loaded', len(frames), 'frames')
+
+# ---- detection: NMS raised to stop collapsing two contested players into one box.
+# Batched in chunks rather than one call over the whole clip - ultralytics accumulates
+# all results in RAM for a single batched call, which combined with holding every frame
+# in memory is what silently OOM-killed the process on a 4216-frame clip. ----
+DETECT_BATCH = 200
+results = []
+for bstart in range(0, len(frames), DETECT_BATCH):
+    results.extend(model(frames[bstart:bstart+DETECT_BATCH], classes=[0], conf=0.25, iou=0.85, verbose=False))
+
+# ---- Pass 1: collect every on-court detection's color histogram across the WHOLE
+# clip, with no team decision yet. Team assignment now happens once, globally, via
+# clustering - not per-detection with one fixed rule - so a single bent-over/angled
+# pose can no longer silently drop a real player the way classify_team_hsv did. ----
+on_court_dets = []  # list of {fi, box, conf, hist}
+for fi, r in enumerate(results):
+    for box, conf in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()):
+        x1, y1, x2, y2 = box
+        fx, fy = (x1+x2)/2, y2
+        if not foot_on_court(fx, fy):
+            continue
+        hist = color_histogram(frames[fi], box)
+        if hist is None:
+            continue
+        on_court_dets.append({'fi': fi, 'box': box, 'conf': float(conf), 'hist': hist})
+print('on-court detections collected for clustering:', len(on_court_dets))
+
+OPPONENT_HUE_CENTER[0] = detect_opponent_hue(on_court_dets, frames, video_path=VIDEO, resize_scale=RESIZE_SCALE)
+print('auto-detected opponent hue center:', OPPONENT_HUE_CENTER[0], '(0=red/180, 60=green, 120=blue)')
+
+# Fit KMeans ONLY on detections the old HSV rule is confident about - a clean subset
+# (matches what validate_color_clustering.py actually tested at 90.1% agreement). If we
+# fit on EVERY on-court detection instead, the many ambiguous/occlusion-contaminated
+# crops (exactly the hard cases we're trying to fix) drag the cluster boundary itself to
+# a worse place, which is what happened on the first attempt: 5-6 clear misclassifications
+# out of 8 spot-checked, most with no occlusion excuse at all. Bootstrap-confident crops
+# get used to LEARN the boundary; every on-court detection (confident or not) still gets
+# CLASSIFIED with it afterwards via predict() - that's the whole point.
+bootstrap_hists, bootstrap_labels = [], []
+for d in on_court_dets:
+    hsv_label = classify_team_hsv(frames[d['fi']], d['box'])
+    if hsv_label is not None:
+        bootstrap_hists.append(d['hist'])
+        bootstrap_labels.append(hsv_label)
+print(f'fitting clustering on {len(bootstrap_hists)} HSV-confident crops (of {len(on_court_dets)} total on-court)')
+
+Xb = np.array(bootstrap_hists, dtype=np.float64)
+km = KMeans(n_clusters=2, random_state=42, n_init=10)
+bootstrap_cluster_ids = km.fit_predict(Xb)
+
+cluster_to_team = {}
+for c in (0, 1):
+    votes = [bootstrap_labels[i] for i in range(len(bootstrap_labels)) if bootstrap_cluster_ids[i] == c]
+    cluster_to_team[c] = max(set(votes), key=votes.count) if votes else (TEAM_WHITE if c == 0 else TEAM_COLOR)
+print('cluster -> team:', cluster_to_team)
+
+X_all = np.array([d['hist'] for d in on_court_dets], dtype=np.float64)
+cluster_ids = km.predict(X_all)
+for i, d in enumerate(on_court_dets):
+    d['team'] = cluster_to_team[cluster_ids[i]]
+
+def classify_team_cluster(frame, box):
+    """Classify a single box via the already-fitted KMeans model - used later for the
+    low-confidence gap-recovery pass, which needs a team check on newly re-detected
+    candidates that weren't part of the original clustering fit."""
+    hist = color_histogram(frame, box)
+    if hist is None:
+        return None
+    cluster = km.predict(hist.reshape(1, -1).astype(np.float64))[0]
+    return cluster_to_team[cluster]
+
+# ---- Pass 2: de-dup same-team overlapping boxes (verified fix from v6), now using the
+# cluster-assigned team ----
+per_frame_dets = []
+dets_by_frame = {}
+for d in on_court_dets:
+    dets_by_frame.setdefault(d['fi'], []).append(d)
+for fi in range(len(frames)):
+    raw = dets_by_frame.get(fi, [])
+    raw = sorted(raw, key=lambda d: -d['conf'])
+    keep = []
+    for d in raw:
+        dup = False
+        for k in keep:
+            if k['team'] == d['team'] and box_iou(k['box'], d['box']) > 0.55:
+                dup = True
+                break
+        if not dup:
+            keep.append(d)
+    dets = []
+    for d in keep:
+        x1, y1, x2, y2 = d['box']
+        cx, cy = (x1+x2)/2, (y1+y2)/2
+        sig = appearance_signature(frames[fi], d['box'])
+        dets.append({'box': d['box'], 'team': d['team'], 'center': (cx, cy), 'sig': sig})
+    per_frame_dets.append(dets)
+print('detections after on-court+team+dedup filter, frame 0:', len(per_frame_dets[0]))
+
+APPEARANCE_WEIGHT = 150.0
+APPEARANCE_EMA = 0.3
+JUMP_REJECT_COST = 1e6       # effectively "never accept this match"
+
+# Two-tier reacquisition gate. Distance alone is only trustworthy for a SHORT gap (a
+# player can't have gone far); for a LONG gap it stops meaning much (a real player can
+# easily be 300px away after 2+ seconds missing) while appearance stays just as valid
+# regardless of how long they were gone - a blue jersey is still blue. So: short gaps
+# are gated on position alone (cheap, reliable at short range); long gaps get a much
+# bigger search radius but ONLY if the appearance signature is a strong, specific match
+# - not just "closest available", which is what let v7's flat 100px cap either wrongly
+# grab a distant stationary player (too loose) or permanently freeze a track that had
+# genuinely moved on (too strict). This replaces both single-number failure modes.
+SHORT_GAP_FRAMES = 8
+SHORT_RANGE_DIST = 80.0          # px - position-only gate for a recently-lost track
+# BUG (found by direct physics check): a flat "long-range" distance cap is the same
+# unbounded-reach mistake as before, just moved to the long-gap tier - it let a track
+# accept a 284px jump after only a 9-frame gap, which implies ~14 m/s, faster than any
+# human sprints. The allowance MUST keep scaling with elapsed time even in the
+# appearance-gated tier; only the per-frame rate and the requirement of a strong
+# appearance match change for long gaps, not "distance stops mattering."
+LONG_RANGE_SPEED_PER_FRAME = 18.0  # px/frame - realistic sprint pace at this court scale
+LONG_RANGE_DIST_CAP = 350.0        # absolute ceiling for genuinely long gaps (~1s+)
+LONG_RANGE_APPEARANCE_MAX = 0.35   # Bhattacharyya distance - must look convincingly similar
+
+class Track:
+    def __init__(self, tid, team, frame_idx, d):
+        self.id = tid
+        self.team = team
+        self.real_boxes = {frame_idx: d['box']}   # only CONFIRMED detections - gaps filled later
+        self.last_real_frame = frame_idx
+        self.last_real_center = d['center']
+        self.signature = d['sig']
+
+    def update(self, frame_idx, d):
+        self.real_boxes[frame_idx] = d['box']
+        self.last_real_frame = frame_idx
+        self.last_real_center = d['center']
+        if d['sig'] is not None:
+            if self.signature is None:
+                self.signature = d['sig']
+            else:
+                self.signature = APPEARANCE_EMA * d['sig'] + (1 - APPEARANCE_EMA) * self.signature
+
+PLAYERS_PER_TEAM = 3
+tracks_by_team = {TEAM_WHITE: [], TEAM_COLOR: []}
+next_id = [0]
+seed_frame = {TEAM_WHITE: None, TEAM_COLOR: None}
+for fi, dets in enumerate(per_frame_dets):
+    for team in (TEAM_WHITE, TEAM_COLOR):
+        if seed_frame[team] is None:
+            team_dets = [d for d in dets if d['team'] == team]
+            if len(team_dets) >= PLAYERS_PER_TEAM:
+                seed_frame[team] = fi
+                for d in team_dets[:PLAYERS_PER_TEAM]:
+                    nt = Track(next_id[0], team, fi, d); next_id[0] += 1
+                    tracks_by_team[team].append(nt)
+
+for fi, dets in enumerate(per_frame_dets):
+    for team in (TEAM_WHITE, TEAM_COLOR):
+        if seed_frame[team] is None or fi <= seed_frame[team]:
+            continue
+        team_dets = [d for d in dets if d['team'] == team]
+        tracks = tracks_by_team[team]
+        if not team_dets:
+            continue  # no candidates at all this frame - leave every track as a gap
+        cost = np.zeros((len(tracks), len(team_dets)))
+        for i, t in enumerate(tracks):
+            gap = fi - t.last_real_frame
+            for j, d in enumerate(team_dets):
+                dx = t.last_real_center[0]-d['center'][0]; dy = t.last_real_center[1]-d['center'][1]
+                pos_dist = (dx*dx+dy*dy) ** 0.5
+                app_dist = appearance_distance(t.signature, d['sig'])
+                base_cost = pos_dist + APPEARANCE_WEIGHT * app_dist
+                if gap <= SHORT_GAP_FRAMES:
+                    plausible = pos_dist <= SHORT_RANGE_DIST
+                else:
+                    allowed_long = min(LONG_RANGE_SPEED_PER_FRAME * gap, LONG_RANGE_DIST_CAP)
+                    plausible = pos_dist <= allowed_long and app_dist <= LONG_RANGE_APPEARANCE_MAX
+                cost[i, j] = base_cost if plausible else JUMP_REJECT_COST
+        row, col = linear_sum_assignment(cost)
+        for r_, c_ in zip(row, col):
+            if cost[r_, c_] < JUMP_REJECT_COST:
+                tracks[r_].update(fi, team_dets[c_])
+            # else: rejected - track stays a gap this frame, filled by interpolation later
+
+all_tracks = tracks_by_team[TEAM_WHITE] + tracks_by_team[TEAM_COLOR]
+print('tracks:', len(all_tracks))
+for t in all_tracks:
+    print(f'  #{t.id} {t.team}: {len(t.real_boxes)} real detections, span {min(t.real_boxes)}-{max(t.real_boxes)}')
+
+# ---- gap recovery pass ----
+# WHY: gaps happen because conf=0.25 is a global threshold tuned to avoid noise across
+# EVERY frame. But for a frame we already know is inside a confirmed gap (real detection
+# before AND after it), we have strong priors a blanket threshold can't use: roughly
+# where the player should be (interpolated from the confirmed endpoints) and what they
+# look like (the track's appearance signature). Re-searching just those frames at a much
+# lower confidence, but only accepting a hit that's both near the expected spot AND a
+# strong appearance match, recovers real signal a global threshold left on the table -
+# without adding noise anywhere else, since this only ever runs on already-known gaps.
+RECOVERY_CONF = 0.08
+RECOVERY_POS_TOL = 70.0
+RECOVERY_APPEARANCE_MAX = 0.3
+MAX_HOLD_SECONDS = 1.5  # also used by fill_track() further below
+recovered_total = 0
+_recovery_max_gap = max(1, round(MAX_HOLD_SECONDS * fps))
+for t in all_tracks:
+    real_frames = sorted(t.real_boxes.keys())
+    for i in range(len(real_frames)-1):
+        fa, fb = real_frames[i], real_frames[i+1]
+        # gaps longer than fill_track's own hold cap get dropped later anyway (and on a
+        # long clip with scene cuts/replays, a huge gap here would mean thousands of
+        # wasted extra YOLO calls searching frames that don't even show the real game feed)
+        if fb - fa <= 1 or fb - fa > _recovery_max_gap:
+            continue
+        ba, bb = np.array(t.real_boxes[fa]), np.array(t.real_boxes[fb])
+        for f in range(fa+1, fb):
+            frac = (f - fa) / (fb - fa)
+            expected_box = ba + (bb - ba) * frac
+            expected_center = ((expected_box[0]+expected_box[2])/2, (expected_box[1]+expected_box[3])/2)
+            r = model(frames[f], classes=[0], conf=RECOVERY_CONF, iou=0.85, verbose=False)[0]
+            best = None
+            for box, conf in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()):
+                x1,y1,x2,y2 = box
+                cx,cy = (x1+x2)/2, (y1+y2)/2
+                pos_dist = ((cx-expected_center[0])**2 + (cy-expected_center[1])**2) ** 0.5
+                if pos_dist > RECOVERY_POS_TOL:
+                    continue
+                team = classify_team_cluster(frames[f], box)
+                if team != t.team:
+                    continue
+                sig = appearance_signature(frames[f], box)
+                app_dist = appearance_distance(t.signature, sig)
+                if app_dist > RECOVERY_APPEARANCE_MAX:
+                    continue
+                score = pos_dist + APPEARANCE_WEIGHT * app_dist
+                if best is None or score < best[0]:
+                    best = (score, box, sig)
+            if best is not None:
+                t.real_boxes[f] = best[1]
+                recovered_total += 1
+print('gap frames recovered (low-confidence YOLO pass):', recovered_total)
+
+# ---- CAMELTrack cross-reference: tried, measured, reverted ----
+# Tested three integration strategies (independent per-frame position check, trust a
+# CamelTrack identity for a whole gap once validated at both edges, edge-validated with
+# a widened per-frame check). Measured against the full pixel-level audit, EVERY version
+# made total flagged issues WORSE, not better (94 with none of this -> 97 -> 113 -> 113).
+# CamelTrack is real signal in isolated spot checks (it correctly separated two tangled
+# players at our single hardest frame), but its own internal identity can also silently
+# drift during occlusion - proven directly: a candidate that matched our confirmed
+# detection at BOTH edges of a 41-frame gap (10-12px position match, high confidence)
+# turned out to be sitting on a different, wrong-colored player by the middle of that
+# same span. No tolerance tuning fixed this without readmitting the original problem.
+# Conclusion: our own pipeline alone, on this clip, outperforms every tested way of
+# blending in CamelTrack's output. Not pursuing further without a fundamentally
+# different integration idea.
+
+# ---- offline gap-filling: interpolate between CONFIRMED real detections instead of
+# extrapolating forward - this is the actual fix for the "ran off to x=1351" bug ----
+# BUG (found by watching Test1's output, not just the aggregate audit number): a track
+# that only ever got real detections in a short early window (e.g. a false-positive that
+# briefly chased a cameraman/scorer's table) was being held FROZEN at that last real
+# position for the rest of the entire clip - one track sat on a scorer's table as a
+# labeled "player" for 313 of 330 frames. The per-track aggregate audit didn't catch this
+# because a busy, textured background (people, equipment) doesn't trip the "floating over
+# empty court" check, and it's outside the drift check's 20-frame radius. Root cause: gap
+# filling had NO cap on gap length - a 2-frame gap and a 300-frame gap were bridged the
+# same way. Fix: cap how long any gap (before the first real detection, after the last,
+# or between two reals) can be bridged. Beyond the cap, the track simply isn't drawn for
+# those frames - an honest "we lost her" is better than a confident-looking wrong guess.
+
+def fill_track(t, n_frames, fps):
+    max_hold = max(1, round(MAX_HOLD_SECONDS * fps))
+    real_frames = sorted(t.real_boxes.keys())
+    filled = {}
+    predicted = set()
+    for f in real_frames:
+        filled[f] = t.real_boxes[f]
+    # before the first real detection: hold steady, but only up to max_hold frames back
+    for f in range(max(0, real_frames[0] - max_hold), real_frames[0]):
+        filled[f] = t.real_boxes[real_frames[0]]
+        predicted.add(f)
+    # after the last real detection: same cap, don't freeze indefinitely
+    for f in range(real_frames[-1] + 1, min(n_frames, real_frames[-1] + 1 + max_hold)):
+        filled[f] = t.real_boxes[real_frames[-1]]
+        predicted.add(f)
+    # between two confirmed detections: linear interpolation, anchored at both ends -
+    # but only if the gap is within the cap; a longer gap means we genuinely don't know
+    # where she was, so leave those middle frames absent rather than inventing a path
+    for i in range(len(real_frames)-1):
+        fa, fb = real_frames[i], real_frames[i+1]
+        if fb - fa <= 1 or fb - fa > max_hold:
+            continue
+        ba, bb = np.array(t.real_boxes[fa]), np.array(t.real_boxes[fb])
+        for f in range(fa+1, fb):
+            frac = (f - fa) / (fb - fa)
+            filled[f] = tuple(ba + (bb - ba) * frac)
+            predicted.add(f)
+    return filled, predicted
+
+def smooth_track(filled, n_frames, window=5):
+    """Light moving-average smoothing on the final box sequence. WHY: diagnosed the
+    'erratic gliding' complaint down to real per-frame detector jitter - two near-
+    duplicate candidate boxes for the SAME real player, just under the dedup IoU
+    threshold, alternately winning the assignment each frame. That's real noise in
+    the raw boxes, not a wrong match, so it needs smoothing, not a matching fix.
+    Only smooths over frames the track is actually present for - fill_track no longer
+    guarantees every frame index exists (see the gap-cap fix above)."""
+    present = sorted(filled.keys())
+    boxes = np.array([filled[f] for f in present])
+    smoothed = {}
+    half = window // 2
+    lo = 0
+    for i, f in enumerate(present):
+        while present[lo] < f - half:
+            lo += 1
+        hi = i
+        while hi + 1 < len(present) and present[hi+1] <= f + half:
+            hi += 1
+        smoothed[f] = tuple(boxes[lo:hi+1].mean(axis=0))
+    return smoothed
