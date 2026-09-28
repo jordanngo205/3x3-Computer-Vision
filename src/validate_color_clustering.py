@@ -46,3 +46,22 @@ def classify_team(frame, box):
     if white_frac < 0.10 and blue_frac < 0.10:
         return None
     return 'Canada' if white_frac >= blue_frac else 'Romania'
+
+def color_histogram(frame, box):
+    """Direct HSV color histogram of the SAME crop region - no deep-learning embedding,
+    just the actual color distribution, matching TrackID3x3's own approach."""
+    x1, y1, x2, y2 = [int(v) for v in box]
+    x1, y1 = max(x1, 0), max(y1, 0)
+    x2, y2 = min(x2, frame.shape[1]-1), min(y2, frame.shape[0]-1)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    w, h = x2 - x1, y2 - y1
+    jx1, jx2 = x1 + int(w*0.25), x1 + int(w*0.75)
+    jy1, jy2 = y1 + int(h*0.18), y1 + int(h*0.5)
+    if jy2 <= jy1 or jx2 <= jx1:
+        return None
+    patch = frame[jy1:jy2, jx1:jx2]
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [16, 8, 8], [0, 180, 0, 256, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist.flatten()
