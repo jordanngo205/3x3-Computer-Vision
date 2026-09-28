@@ -660,3 +660,9 @@ def results(slug: str):
         calibration_matrix=calibration_matrix,
         court_reference_path=ensure_clean_court_reference(),
     )
+
+
+if __name__ == "__main__":
+    host = os.environ.get("SHOT_TAGGER_HOST", "127.0.0.1")
+    port = int(os.environ.get("SHOT_TAGGER_PORT", "5050"))
+    app.run(host=host, port=port, debug=True, use_reloader=False)
