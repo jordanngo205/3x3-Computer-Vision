@@ -65,3 +65,61 @@ def color_histogram(frame, box):
     hist = cv2.calcHist([hsv], [0, 1, 2], None, [16, 8, 8], [0, 180, 0, 256, 0, 256])
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist.flatten()
+
+print('loading video...')
+model = YOLO('/Users/jordanngo/Projects/AI live tracking/yolo11n.pt')
+cap = cv2.VideoCapture(VIDEO)
+frames = []
+while True:
+    ok, f = cap.read()
+    if not ok:
+        break
+    frames.append(f)
+cap.release()
+print('loaded', len(frames), 'frames')
+
+print('running detection + collecting crops...')
+results = model(frames, classes=[0], conf=0.25, iou=0.85, verbose=False)
+
+hists = []
+hsv_labels = []
+for fi, r in enumerate(results):
+    frame = frames[fi]
+    for box, conf in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()):
+        x1, y1, x2, y2 = box
+        fx, fy = (x1+x2)/2, y2
+        if not foot_on_court(fx, fy):
+            continue
+        label = classify_team(frame, box)
+        if label is None:
+            continue
+        hist = color_histogram(frame, box)
+        if hist is None:
+            continue
+        hists.append(hist)
+        hsv_labels.append(label)
+
+print('collected', len(hists), 'labeled crops (Canada:', hsv_labels.count('Canada'), 'Romania:', hsv_labels.count('Romania'), ')')
+
+X = np.array(hists)
+print('running KMeans k=2 directly on color histograms...')
+km = KMeans(n_clusters=2, random_state=42, n_init=10)
+cluster_ids = km.fit_predict(X)
+
+cluster_to_team = {}
+for c in (0, 1):
+    labels_in_c = [hsv_labels[i] for i in range(len(hsv_labels)) if cluster_ids[i] == c]
+    if not labels_in_c:
+        continue
+    majority = max(set(labels_in_c), key=labels_in_c.count)
+    cluster_to_team[c] = majority
+
+pred_labels = [cluster_to_team[c] for c in cluster_ids]
+agree = sum(1 for p, g in zip(pred_labels, hsv_labels) if p == g)
+print(f'agreement: {agree}/{len(hsv_labels)} = {100*agree/len(hsv_labels):.1f}%')
+
+for c in (0, 1):
+    idxs = [i for i in range(len(hsv_labels)) if cluster_ids[i] == c]
+    canada_n = sum(1 for i in idxs if hsv_labels[i] == 'Canada')
+    romania_n = sum(1 for i in idxs if hsv_labels[i] == 'Romania')
+    print(f'cluster {c} -> {cluster_to_team.get(c)}: {len(idxs)} items ({canada_n} Canada-HSV, {romania_n} Romania-HSV)')
