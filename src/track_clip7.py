@@ -597,3 +597,61 @@ def smooth_track(filled, n_frames, window=5):
             hi += 1
         smoothed[f] = tuple(boxes[lo:hi+1].mean(axis=0))
     return smoothed
+
+MIN_REAL_DETECTIONS = 15
+MIN_MOVEMENT = 40
+kept = []
+for t in all_tracks:
+    if len(t.real_boxes) < MIN_REAL_DETECTIONS:
+        continue
+    feet = [((b[0]+b[2])/2, b[3]) for b in t.real_boxes.values()]
+    xs = [p[0] for p in feet]; ys = [p[1] for p in feet]
+    spread = ((max(xs)-min(xs))**2 + (max(ys)-min(ys))**2) ** 0.5
+    if spread < MIN_MOVEMENT:
+        print(f'  dropping #{t.id} {t.team}: spread={spread:.0f}px (likely stationary ref/staff)')
+        continue
+    filled, predicted = fill_track(t, len(frames), fps)
+    filled = smooth_track(filled, len(frames))
+    kept.append((t, filled, predicted))
+print('kept tracks:', len(kept))
+for t, filled, predicted in kept:
+    print(f'  #{t.id} {t.team}: {len(filled)}/{len(frames)} frames shown ({len(predicted)} interpolated/held)')
+
+TEAM_COLORS = {TEAM_WHITE: (255,255,255), TEAM_COLOR: (255,140,0)}
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+writer = cv2.VideoWriter(OUT_VIDEO, fourcc, fps, (w, h))
+for fi, frame in enumerate(frames):
+    out = frame.copy()
+    for t, filled, predicted in kept:
+        if fi not in filled:
+            continue
+        color = TEAM_COLORS[t.team]
+        x1,y1,x2,y2 = [int(v) for v in filled[fi]]
+        if fi in predicted:
+            for xx in range(x1, x2, 12):
+                cv2.line(out, (xx,y1), (min(xx+6,x2),y1), color, 2)
+                cv2.line(out, (xx,y2), (min(xx+6,x2),y2), color, 2)
+            for yy in range(y1, y2, 12):
+                cv2.line(out, (x1,yy), (x1,min(yy+6,y2)), color, 2)
+                cv2.line(out, (x2,yy), (x2,min(yy+6,y2)), color, 2)
+        else:
+            cv2.rectangle(out, (x1,y1), (x2,y2), color, 2)
+        cv2.putText(out, f'{t.team} #{t.id}', (x1, max(0,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    writer.write(out)
+writer.release()
+print('saved', OUT_VIDEO)
+
+with open(OUT_JSON, 'w') as f:
+    json.dump({
+        'fps': fps, 'width': w, 'height': h, 'n_frames': n_frames,
+        'tracks': {str(t.id): {str(k): [float(x) for x in v] for k,v in filled.items()} for t,filled,pred in kept},
+        'predicted': {str(t.id): sorted(int(x) for x in pred) for t,filled,pred in kept},
+        'track_team': {str(t.id): t.team for t,filled,pred in kept},
+    }, f)
+print('saved', OUT_JSON)
+
+import pickle
+CLASSIFIER_OUT = OUT_JSON.replace('output_tracks_', 'output_team_classifier_').replace('.json', '.pkl')
+with open(CLASSIFIER_OUT, 'wb') as f:
+    pickle.dump({'kmeans': km, 'cluster_to_team': cluster_to_team}, f)
+print('saved', CLASSIFIER_OUT)
