@@ -93,3 +93,127 @@ def containment(outer, inner):
     inter = (x2 - x1) * (y2 - y1)
     area_inner = max(1e-6, (inner[2] - inner[0]) * (inner[3] - inner[1]))
     return inter / area_inner
+
+
+def reject_two_person_boxes(dets, min_aspect, contain_frac, contain_area_ratio):
+    """Drop detections that are actually TWO players wrapped in one box.
+
+    During contact the detector regularly emits a single box around a pair -
+    tracking those as if they were people inflates the identity count, steals
+    matches from the real players, and feeds two-player crops to the
+    appearance model. Two independent tells:
+
+      1. shape - an upright player's box is much taller than it is wide; a box
+         around two players standing side by side is far squarer.
+      2. containment - a box that entirely swallows two other detections is a
+         wrapper around them, not a person of its own.
+    """
+    kept, dropped_shape, dropped_wrapper = [], 0, 0
+    for i, a in enumerate(dets):
+        aw, ah = a[2] - a[0], a[3] - a[1]
+        if aw <= 0 or ah <= 0:
+            continue
+        if ah / aw < min_aspect:
+            dropped_shape += 1
+            continue
+        area_a = aw * ah
+        swallowed = 0
+        for j, b in enumerate(dets):
+            if i == j:
+                continue
+            area_b = max(1e-6, (b[2] - b[0]) * (b[3] - b[1]))
+            if containment(a, b) >= contain_frac and area_a >= contain_area_ratio * area_b:
+                swallowed += 1
+        if swallowed >= 2:
+            dropped_wrapper += 1
+            continue
+        kept.append(a)
+    return kept, dropped_shape, dropped_wrapper
+
+
+def box_iou(a, b):
+    x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inter = (x2 - x1) * (y2 - y1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (area_a + area_b - inter)
+
+
+def merge_tracklets(history, galleries, max_overlap_frames, appearance_max, gap_reach_per_frame):
+    """Offline pass: stitch fragments of the same player back together.
+
+    Adapted from the ID Switch Detection & Merging step in TrackID3x3
+    (arXiv:2503.18282), whose key insight is a hard physical constraint:
+    two tracklets that are on court AT THE SAME TIME cannot be the same
+    person. A player who picks up a fresh ID coming out of a screen never
+    coexists with their old ID, so the pair is free to merge.
+
+    We add two checks the paper's version doesn't need (it merges only into
+    tracks present from frame 0; we merge any pair, so we must be stricter):
+    the two fragments have to look alike, and the jump between where one
+    ended and the other began has to be physically plausible for the gap.
+
+    Returns {track_id: merged_id}.
+    """
+    ids = sorted(history)
+    spans = {i: (min(history[i]), max(history[i])) for i in ids}
+    frames = {i: set(history[i]) for i in ids}
+    parent = {i: i for i in ids}
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    # try the closest-in-time pairs first: a fragment is most likely to belong
+    # to whoever just disappeared, not to someone who vanished a minute ago
+    candidates = []
+    for a in ids:
+        for b in ids:
+            if a == b or spans[a][1] >= spans[b][0]:
+                continue  # b must start after a ends
+            gap = spans[b][0] - spans[a][1]
+            candidates.append((gap, a, b))
+    candidates.sort()
+
+    merged = 0
+    for gap, a, b in candidates:
+        ra, rb = root(a), root(b)
+        if ra == rb:
+            continue
+        # the physical constraint: never merge two tracklets that were on
+        # court simultaneously - collapse the merged groups, not just the pair
+        group_a = [i for i in ids if root(i) == ra]
+        group_b = [i for i in ids if root(i) == rb]
+        overlap = 0
+        for i in group_a:
+            for j in group_b:
+                overlap += len(frames[i] & frames[j])
+        if overlap > max_overlap_frames:
+            continue
+
+        ga, gb = galleries.get(a), galleries.get(b)
+        if not ga or not gb:
+            continue
+        look_alike = min(float(np.linalg.norm(x - y)) for x in ga for y in gb)
+        if look_alike > appearance_max:
+            continue
+
+        last_box = history[a][spans[a][1]]
+        first_box = history[b][spans[b][0]]
+        lcx, lcy = (last_box[0] + last_box[2]) / 2, (last_box[1] + last_box[3]) / 2
+        fcx, fcy = (first_box[0] + first_box[2]) / 2, (first_box[1] + first_box[3]) / 2
+        jump = ((fcx - lcx) ** 2 + (fcy - lcy) ** 2) ** 0.5
+        height = max(1.0, last_box[3] - last_box[1])
+        if jump > height * gap_reach_per_frame * max(1, gap):
+            continue  # they'd have had to teleport
+
+        parent[rb] = ra
+        merged += 1
+
+    mapping = {i: root(i) for i in ids}
+    return mapping, merged
