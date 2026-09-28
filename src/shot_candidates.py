@@ -532,3 +532,159 @@ def candidate_rim_distance(candidate: Dict[str, Any]) -> float:
     rim_x, rim_y = candidate["lane"]["rim_px"]
     ball_x, ball_y = candidate["ball"]["center"]
     return float(math.hypot(ball_x - rim_x, ball_y - rim_y))
+
+
+def same_rim_context(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    if a["lane"]["side"] != b["lane"]["side"]:
+        return False
+    return (
+        abs(float(a["lane"]["rim_px"][0]) - float(b["lane"]["rim_px"][0])) <= 70.0
+        and abs(float(a["lane"]["rim_px"][1]) - float(b["lane"]["rim_px"][1])) <= 90.0
+    )
+
+
+def cluster_raw_candidates(
+    raw_candidates: List[Dict[str, Any]],
+    scan_step_s: float,
+) -> List[List[Dict[str, Any]]]:
+    if not raw_candidates:
+        return []
+
+    sorted_candidates = sorted(raw_candidates, key=lambda candidate: float(candidate["peak_timestamp"]))
+    max_gap_s = max(scan_step_s * 3.2, 0.78)
+    clusters: List[List[Dict[str, Any]]] = []
+    current_cluster: List[Dict[str, Any]] = []
+
+    for candidate in sorted_candidates:
+        if (
+            current_cluster
+            and float(candidate["peak_timestamp"]) - float(current_cluster[-1]["peak_timestamp"]) <= max_gap_s
+            and same_rim_context(candidate, current_cluster[-1])
+        ):
+            current_cluster.append(candidate)
+            continue
+
+        if current_cluster:
+            clusters.append(current_cluster)
+        current_cluster = [candidate]
+
+    if current_cluster:
+        clusters.append(current_cluster)
+    return clusters
+
+
+def pick_shot_from_cluster(
+    cluster: List[Dict[str, Any]],
+    *,
+    scan_step_s: float,
+) -> Dict[str, Any] | None:
+    if len(cluster) < 2:
+        return None
+
+    distances = [candidate_rim_distance(candidate) for candidate in cluster]
+    contact_index = min(
+        range(len(cluster)),
+        key=lambda index: (distances[index], -float(cluster[index]["score"])),
+    )
+    contact_candidate = cluster[contact_index]
+    contact_distance = distances[contact_index]
+    if contact_distance > MAX_CLUSTER_CONTACT_DISTANCE_PX:
+        return None
+
+    best_release_index: int | None = None
+    best_release_score: float | None = None
+    contact_timestamp = float(contact_candidate["peak_timestamp"])
+    for release_index in range(contact_index):
+        release_distance = distances[release_index]
+        if release_distance < contact_distance + MIN_CLUSTER_APPROACH_DELTA_PX:
+            continue
+
+        release_timestamp = float(cluster[release_index]["peak_timestamp"])
+        if contact_timestamp - release_timestamp < max(scan_step_s * 0.75, 0.18):
+            continue
+
+        approach_distances = distances[release_index : contact_index + 1]
+        approach_steps = 0
+        for previous, current in zip(approach_distances, approach_distances[1:]):
+            if current <= previous - 4.0:
+                approach_steps += 1
+        if approach_steps < max(1, len(approach_distances) - 2):
+            continue
+
+        release_score = (release_distance - contact_distance) * 4.0 + (contact_timestamp - release_timestamp) * 10.0
+        if best_release_score is None or release_score > best_release_score:
+            best_release_index = release_index
+            best_release_score = float(release_score)
+
+    if best_release_index is None:
+        return None
+
+    release_candidate = cluster[best_release_index]
+    release_distance = distances[best_release_index]
+
+    cluster_score = max(float(candidate["score"]) for candidate in cluster) + (release_distance - contact_distance) * 4.0
+    return {
+        "peak_candidate": contact_candidate,
+        "release_candidate": release_candidate,
+        "cluster_score": float(cluster_score),
+    }
+
+
+def build_sampled_sequence(
+    raw_candidates: List[Dict[str, Any]],
+    peak_candidate: Dict[str, Any],
+    scan_step_s: float,
+) -> List[Dict[str, Any]]:
+    peak_timestamp = float(peak_candidate["peak_timestamp"])
+    window = [
+        candidate
+        for candidate in raw_candidates
+        if 0.0 <= peak_timestamp - float(candidate["peak_timestamp"]) <= 1.1
+        and same_rim_context(candidate, peak_candidate)
+    ]
+    if not window:
+        return []
+
+    window.sort(key=lambda candidate: float(candidate["peak_timestamp"]))
+    sequence = [window[-1]]
+    max_gap_s = max(scan_step_s * 1.6, 0.36)
+    for candidate in reversed(window[:-1]):
+        if float(sequence[0]["peak_timestamp"]) - float(candidate["peak_timestamp"]) <= max_gap_s:
+            sequence.insert(0, candidate)
+        else:
+            break
+    return sequence
+
+
+def pick_release_from_sampled_sequence(
+    sequence: List[Dict[str, Any]],
+    *,
+    scan_step_s: float,
+) -> Dict[str, Any] | None:
+    if len(sequence) < 3:
+        return None
+
+    distances = [candidate_rim_distance(candidate) for candidate in sequence]
+    peak_distance = distances[-1]
+    if peak_distance > MAX_PEAK_RIM_DISTANCE_PX:
+        return None
+
+    approach_steps = 0
+    for previous, current in zip(distances, distances[1:]):
+        if current <= previous - 6.0:
+            approach_steps += 1
+    if approach_steps < max(2, len(distances) - 2):
+        return None
+
+    best_index = max(range(len(sequence) - 1), key=lambda index: distances[index])
+    release_candidate = sequence[best_index]
+    release_distance = distances[best_index]
+    if release_distance < max(MIN_RELEASE_RIM_DISTANCE_PX, peak_distance + MIN_APPROACH_DELTA_PX):
+        return None
+
+    peak_timestamp = float(sequence[-1]["peak_timestamp"])
+    release_timestamp = float(release_candidate["peak_timestamp"])
+    if peak_timestamp - release_timestamp < max(scan_step_s * 0.75, 0.18):
+        return None
+
+    return release_candidate
