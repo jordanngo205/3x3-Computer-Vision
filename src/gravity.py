@@ -93,3 +93,7 @@ def main():
         json.dump({"fps": fps, "frames": {str(k): v for k, v in per_frame.items()}},
                   open(args.out, "w"))
         print(f"\nper-frame gravity -> {args.out}")
+
+
+if __name__ == "__main__":
+    main()
