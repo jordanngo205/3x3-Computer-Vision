@@ -148,3 +148,207 @@ def is_valid_review_clip(path: Path) -> bool:
     except subprocess.TimeoutExpired:
         return False
     return completed.returncode == 0
+
+
+def ensure_review_clip(profile: Dict[str, Any], event_number: int, timestamp_text: str | None) -> Dict[str, Any] | None:
+    if not timestamp_text:
+        return None
+
+    try:
+        timestamp_s = float(timestamp_text)
+    except (TypeError, ValueError):
+        return None
+
+    video_relpath = profile.get("video_path")
+    if not video_relpath:
+        return None
+
+    video_path = ROOT / str(video_relpath)
+    if not video_path.exists():
+        return None
+
+    duration_s = float(profile.get("duration_seconds") or 0.0)
+    clip_start_s = max(0.0, timestamp_s - REVIEW_CLIP_BEFORE_S)
+    clip_end_s = timestamp_s + REVIEW_CLIP_AFTER_S
+    if duration_s > 0:
+        clip_end_s = min(duration_s, clip_end_s)
+    clip_duration_s = max(0.25, clip_end_s - clip_start_s)
+
+    paths = profile_paths(ROOT, profile["slug"])
+    out_path = paths["review_clips_dir"] / f"event_{event_number:03d}_{timestamp_s:06.2f}s.mp4"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_out_path = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
+
+    if out_path.exists() and is_valid_review_clip(out_path):
+        return review_clip_info(out_path, clip_start_s, clip_end_s, timestamp_s)
+
+    if out_path.exists():
+        out_path.unlink(missing_ok=True)
+    temp_out_path.unlink(missing_ok=True)
+
+    command = [
+        bundled_ffmpeg_exe(),
+        "-y",
+        "-ss",
+        f"{clip_start_s:.3f}",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{clip_duration_s:.3f}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(temp_out_path),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        temp_out_path.unlink(missing_ok=True)
+        return None
+    if completed.returncode != 0:
+        temp_out_path.unlink(missing_ok=True)
+        return None
+    os.replace(temp_out_path, out_path)
+
+    if not is_valid_review_clip(out_path):
+        out_path.unlink(missing_ok=True)
+        return None
+
+    return review_clip_info(out_path, clip_start_s, clip_end_s, timestamp_s)
+
+
+def parse_event_timestamp(timestamp_text: str | None) -> float | None:
+    if not timestamp_text:
+        return None
+    try:
+        return float(timestamp_text)
+    except (TypeError, ValueError):
+        return None
+
+
+def ensure_review_frames(profile: Dict[str, Any], event_number: int, timestamp_s: float) -> List[Dict[str, Any]]:
+    video_relpath = profile.get("video_path")
+    if not video_relpath:
+        return []
+
+    video_path = ROOT / str(video_relpath)
+    if not video_path.exists():
+        return []
+
+    duration_s = float(profile.get("duration_seconds") or 0.0)
+    paths = profile_paths(ROOT, profile["slug"])
+    frame_dir = paths["review_frames_dir"] / f"event_{event_number:03d}_{timestamp_s:06.2f}s"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    review_frames: List[Dict[str, Any]] = []
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return []
+
+    for index, offset_s in enumerate(REVIEW_FRAME_OFFSETS_S):
+        frame_time_s = timestamp_s + offset_s
+        if duration_s > 0:
+            frame_time_s = min(max(0.0, frame_time_s), duration_s)
+        else:
+            frame_time_s = max(0.0, frame_time_s)
+
+        frame_path = frame_dir / f"frame_{index:02d}_{frame_time_s:06.2f}s.png"
+        if not frame_path.exists():
+            capture.set(cv2.CAP_PROP_POS_MSEC, frame_time_s * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                continue
+            cv2.imwrite(str(frame_path), frame)
+
+        review_frames.append(
+            {
+                "path": str(frame_path.relative_to(ROOT)),
+                "timestamp_s": frame_time_s,
+                "is_event_moment": abs(offset_s) < 1e-9,
+            }
+        )
+
+    capture.release()
+    return review_frames
+
+
+def ensure_review_gif(profile: Dict[str, Any], event_number: int, timestamp_s: float, review_frames: List[Dict[str, Any]]) -> str | None:
+    if not review_frames:
+        return None
+
+    paths = profile_paths(ROOT, profile["slug"])
+    gif_path = paths["review_gifs_dir"] / f"event_{event_number:03d}_{timestamp_s:06.2f}s.gif"
+    gif_path.parent.mkdir(parents=True, exist_ok=True)
+    if gif_path.exists():
+        return str(gif_path.relative_to(ROOT))
+
+    images: List[Image.Image] = []
+    try:
+        for frame in review_frames:
+            image = Image.open(ROOT / frame["path"]).convert("RGB")
+            image.thumbnail((720, 405))
+            images.append(image)
+
+        if not images:
+            return None
+
+        images[0].save(
+            gif_path,
+            save_all=True,
+            append_images=images[1:],
+            duration=REVIEW_GIF_DURATION_MS,
+            loop=0,
+            optimize=False,
+        )
+    finally:
+        for image in images:
+            image.close()
+
+    return str(gif_path.relative_to(ROOT))
+
+
+def load_calibration(slug: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+    paths = profile_paths(ROOT, slug)
+    if paths["calibration"].exists():
+        return read_json(paths["calibration"])
+    return {
+        "video": profile["video_name"],
+        "frame_image": profile["sample_frames"][0] if profile["sample_frames"] else "",
+        "landmarks_px": {},
+    }
+
+
+def try_auto_calibration(slug: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+    paths = profile_paths(ROOT, slug)
+    absolute_frames = [ROOT / relative for relative in profile["sample_frames"]]
+    payload = auto_calibrate_frames(
+        video_name=profile["video_name"],
+        frame_paths=absolute_frames,
+        relative_frame_paths=profile["sample_frames"],
+        debug_dir=paths["auto_calibration_debug_dir"],
+    )
+    write_json(paths["calibration"], payload)
+    return payload
+
+
+def read_events(slug: str) -> List[Dict[str, str]]:
+    path = profile_paths(ROOT, slug)["events"]
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def write_events(slug: str, rows: List[Dict[str, str]]) -> None:
+    path = profile_paths(ROOT, slug)["events"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["timestamp", "frame_image", "label", "pixel_x", "pixel_y", "result", "play_type", "notes"]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
