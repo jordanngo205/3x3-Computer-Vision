@@ -57,3 +57,39 @@ def compute_embedding(model, device, frame, box):
     tensor = torch.from_numpy(np.transpose(crop, (2, 0, 1))).unsqueeze(0).to(device)
     with torch.no_grad():
         return model(tensor).cpu().numpy()[0]
+
+
+def appearance_distance(gallery, emb):
+    """Distance from a detection's look to a track's gallery of recent clean
+    looks - min over the gallery, so matching works even when the player's
+    pose/angle changed since most snapshots were taken."""
+    if not gallery or emb is None:
+        return float("inf")
+    return min(float(np.linalg.norm(g - emb)) for g in gallery)
+
+
+GALLERY_SIZE = 10       # clean appearance snapshots kept per track
+COAST_DECAY = 0.92      # per-frame damping of a hidden player's predicted motion
+COAST_MAX_SPEED = 30.0  # px/frame cap so a bad velocity estimate can't run away
+
+# Default court boundary for 960x540 clips (same framing as video.mp4/the
+# same_game_clips). Override with --court-poly for a different camera framing.
+DEFAULT_COURT_POLY = np.array([
+    (105, 300), (30, 355), (0, 400), (0, 540), (650, 540),
+    (760, 430), (830, 330), (830, 260), (350, 248),
+], dtype=np.int32)
+
+
+def foot_on_court(court_poly, fx, fy):
+    return cv2.pointPolygonTest(court_poly, (float(fx), float(fy)), False) >= 0
+
+
+def containment(outer, inner):
+    """Fraction of `inner`'s area that sits inside `outer`."""
+    x1 = max(outer[0], inner[0]); y1 = max(outer[1], inner[1])
+    x2 = min(outer[2], inner[2]); y2 = min(outer[3], inner[3])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inter = (x2 - x1) * (y2 - y1)
+    area_inner = max(1e-6, (inner[2] - inner[0]) * (inner[3] - inner[1]))
+    return inter / area_inner
