@@ -148,6 +148,13 @@ def main():
     p.add_argument("--all-cameras", action="store_true",
                    help="process every frame, including shots from other cameras the calibration "
                         "does not apply to")
+    p.add_argument("--tracker", default="botsort.yaml",
+                   help="ultralytics tracker config. BoT-SORT uses motion prediction and global "
+                        "motion compensation for the panning camera, so a player keeps one id "
+                        "through a possession instead of the frame-to-frame box overlap we used "
+                        "before - which broke whenever a player was briefly occluded.")
+    p.add_argument("--greedy-link", action="store_true",
+                   help="use the old box-overlap linker instead of BoT-SORT")
     p.add_argument("--keep-referees", action="store_true",
                    help="keep officials in the output instead of filtering them out")
     p.add_argument("--max-depth", type=float, default=1000.0,
@@ -211,9 +218,17 @@ def main():
             detections[fi] = []
             fi += 1
             continue
-        res = model(frame, conf=args.conf, iou=0.85, imgsz=args.imgsz, verbose=False)[0]
+        if args.greedy_link:
+            res = model(frame, conf=args.conf, iou=0.85, imgsz=args.imgsz, verbose=False)[0]
+        else:
+            res = model.track(frame, conf=args.conf, iou=0.85, imgsz=args.imgsz,
+                              tracker=args.tracker, persist=True, verbose=False)[0]
         boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else np.empty((0, 4))
         kps = res.keypoints.data.cpu().numpy() if res.keypoints is not None else None
+        # BoT-SORT gives an id per detection; it is None before the tracker has
+        # settled, and for detections it chose not to track
+        ids = (res.boxes.id.cpu().numpy().astype(int)
+               if (res.boxes is not None and res.boxes.id is not None) else None)
 
         here = []
         for i, box in enumerate(boxes):
@@ -232,13 +247,16 @@ def main():
             if not args.keep_referees and looks_like_referee(frame, box, cx, cy):
                 n_refs[0] += 1
                 continue
-            here.append({"box": box, "kp": kps[i], "pt": pt, "cx": float(cx), "cy": float(cy),
-                         "feat": torso_feature(frame, box)})
+            d = {"box": box, "kp": kps[i], "pt": pt, "cx": float(cx), "cy": float(cy),
+                 "feat": torso_feature(frame, box)}
+            if ids is not None and i < len(ids):
+                d["tid"] = int(ids[i])
+            here.append(d)
 
-        # link detections frame to frame by box overlap, purely to accumulate
-        # colour votes along one player's run
+        # link to existing tracks by overlap, purely to accumulate colour votes.
+        # Only needed when BoT-SORT is off - it already supplies ids.
         used = set()
-        for tid in list(tracks):
+        for tid in (list(tracks) if args.greedy_link else []):
             best, bi = 0.25, None
             for j, d in enumerate(here):
                 if j in used:
@@ -254,10 +272,16 @@ def main():
                 tracks[tid] = {"box": here[bi]["box"], "missed": 0}
                 here[bi]["tid"] = tid
                 used.add(bi)
+        # anything still without an id (BoT-SORT declined to track it, or the
+        # greedy linker found no overlap) starts its own track. Negative ids
+        # keep these clear of BoT-SORT's own numbering.
         for j, d in enumerate(here):
             if "tid" not in d:
-                tracks[next_id] = {"box": d["box"], "missed": 0}
-                d["tid"] = next_id
+                if args.greedy_link:
+                    tracks[next_id] = {"box": d["box"], "missed": 0}
+                    d["tid"] = next_id
+                else:
+                    d["tid"] = -1 - next_id
                 next_id += 1
 
         detections[fi] = here
