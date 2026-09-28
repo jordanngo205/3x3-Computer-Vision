@@ -146,6 +146,8 @@ def main():
     p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--imgsz", type=int, default=1280)
     p.add_argument("--save-positions", default=None)
+    p.add_argument("--smooth-seconds", type=float, default=0.25,
+                   help="window for smoothing court positions along a track")
     p.add_argument("--no-track-vote", action="store_true",
                    help="keep the per-frame kit call instead of settling each track on one kit")
     p.add_argument("--all-cameras", action="store_true",
@@ -269,6 +271,27 @@ def main():
         if fi % 60 == 0:
             print(f"frame {fi}: {len(here)} on court", flush=True)
     cap.release()
+
+    # smooth each track's court position over a short window. A single frame's
+    # ankle keypoints jitter by a few pixels, and the homography turns that into
+    # tens of centimetres on the far side of the court, which reads as the dots
+    # zigzagging instead of walking.
+    win = max(1, int(round(args.smooth_seconds * fps)))
+    if win > 1:
+        by_track = {}
+        for f, ds in detections.items():
+            for d in ds:
+                by_track.setdefault(d.get("tid"), []).append((f, d))
+        for tid, seq in by_track.items():
+            seq.sort(key=lambda t: t[0])
+            xs = np.array([d["cx"] for _, d in seq], dtype=float)
+            ys = np.array([d["cy"] for _, d in seq], dtype=float)
+            k = np.ones(win) / win
+            pad = win // 2
+            sx = np.convolve(np.pad(xs, pad, mode="edge"), k, mode="valid")[:len(xs)]
+            sy = np.convolve(np.pad(ys, pad, mode="edge"), k, mode="valid")[:len(ys)]
+            for (f, d), a, b in zip(seq, sx, sy):
+                d["cx"], d["cy"] = float(a), float(b)
 
     # settle each track on one kit by voting its per-frame calls: a single
     # frame's torso patch is far too noisy to trust on its own
