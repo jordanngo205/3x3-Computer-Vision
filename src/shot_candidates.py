@@ -932,3 +932,7 @@ def main() -> None:
         max_candidates=int(args.max_candidates),
     )
     print(json.dumps(rows, indent=2))
+
+
+if __name__ == "__main__":
+    main()
