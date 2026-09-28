@@ -555,3 +555,7 @@ def main():
     cap.release()
     writer.release()
     print(f"done. saved -> {out_path}")
+
+
+if __name__ == "__main__":
+    main()
