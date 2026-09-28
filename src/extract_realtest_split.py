@@ -94,3 +94,7 @@ def main():
         json.dump(eval_manifest, f)
     print(f"held-out eval manifest (second half only): {len(eval_pos)} positive, {len(eval_neg)} negative")
     print(f"  -> {EVAL_MANIFEST}")
+
+
+if __name__ == "__main__":
+    main()
