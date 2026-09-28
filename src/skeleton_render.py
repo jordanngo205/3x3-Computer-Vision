@@ -112,3 +112,7 @@ def main():
     print(f"skeletons per frame: {people_total / max(1, fi):.1f}")
     if ball_model is not None:
         print(f"ball found in {ball_frames}/{fi} frames ({100 * ball_frames / max(1, fi):.0f}%)")
+
+
+if __name__ == "__main__":
+    main()
