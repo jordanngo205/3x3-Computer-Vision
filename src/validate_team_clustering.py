@@ -45,3 +45,89 @@ def classify_team(frame, box):
     if white_frac < 0.10 and blue_frac < 0.10:
         return None
     return 'Canada' if white_frac >= blue_frac else 'Romania'
+
+print('loading video...')
+model = YOLO('/Users/jordanngo/Projects/AI live tracking/yolo11n.pt')
+cap = cv2.VideoCapture(VIDEO)
+frames = []
+while True:
+    ok, f = cap.read()
+    if not ok:
+        break
+    frames.append(f)
+cap.release()
+print('loaded', len(frames), 'frames')
+
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+print('loading SigLIP on', device, '...')
+proc = AutoProcessor.from_pretrained('google/siglip-base-patch16-224')
+siglip = AutoModel.from_pretrained('google/siglip-base-patch16-224').to(device).eval()
+
+print('running detection + collecting crops...')
+results = model(frames, classes=[0], conf=0.25, iou=0.85, verbose=False)
+
+crops = []       # RGB numpy patches
+hsv_labels = []   # ground truth from classify_team
+meta = []         # (frame_idx, box)
+for fi, r in enumerate(results):
+    frame = frames[fi]
+    for box, conf in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()):
+        x1, y1, x2, y2 = box
+        fx, fy = (x1+x2)/2, y2
+        if not foot_on_court(fx, fy):
+            continue
+        label = classify_team(frame, box)
+        if label is None:
+            continue
+        xi1, yi1, xi2, yi2 = [int(v) for v in box]
+        xi1, yi1 = max(xi1, 0), max(yi1, 0)
+        xi2, yi2 = min(xi2, frame.shape[1]-1), min(yi2, frame.shape[0]-1)
+        if xi2 <= xi1 or yi2 <= yi1:
+            continue
+        patch = cv2.cvtColor(frame[yi1:yi2, xi1:xi2], cv2.COLOR_BGR2RGB)
+        crops.append(patch)
+        hsv_labels.append(label)
+        meta.append((fi, box))
+
+print('collected', len(crops), 'labeled crops (Canada:', hsv_labels.count('Canada'), 'Romania:', hsv_labels.count('Romania'), ')')
+
+print('computing SigLIP embeddings...')
+embeddings = []
+batch_size = 32
+with torch.no_grad():
+    for i in range(0, len(crops), batch_size):
+        batch = crops[i:i+batch_size]
+        inputs = proc(images=batch, return_tensors='pt').to(device)
+        feats = siglip.get_image_features(**inputs)
+        embeddings.append(feats.cpu().numpy())
+embeddings = np.concatenate(embeddings, axis=0)
+print('embeddings shape:', embeddings.shape)
+
+print('running UMAP...')
+reducer = umap.UMAP(n_components=5, random_state=42)
+reduced = reducer.fit_transform(embeddings)
+
+print('running KMeans k=2...')
+km = KMeans(n_clusters=2, random_state=42, n_init=10)
+cluster_ids = km.fit_predict(reduced)
+
+# Map cluster ids -> team names by majority vote against HSV labels (clustering has no
+# inherent notion of "Canada" vs "Romania", just group A vs group B)
+cluster_to_team = {}
+for c in (0, 1):
+    labels_in_c = [hsv_labels[i] for i in range(len(hsv_labels)) if cluster_ids[i] == c]
+    if not labels_in_c:
+        continue
+    majority = max(set(labels_in_c), key=labels_in_c.count)
+    cluster_to_team[c] = majority
+
+pred_labels = [cluster_to_team[c] for c in cluster_ids]
+agree = sum(1 for p, g in zip(pred_labels, hsv_labels) if p == g)
+print(f'agreement: {agree}/{len(hsv_labels)} = {100*agree/len(hsv_labels):.1f}%')
+
+# per-cluster breakdown
+for c in (0, 1):
+    idxs = [i for i in range(len(hsv_labels)) if cluster_ids[i] == c]
+    canada_n = sum(1 for i in idxs if hsv_labels[i] == 'Canada')
+    romania_n = sum(1 for i in idxs if hsv_labels[i] == 'Romania')
+    print(f'cluster {c} -> {cluster_to_team.get(c)}: {len(idxs)} items ({canada_n} Canada-HSV, {romania_n} Romania-HSV)')
