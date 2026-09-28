@@ -52,3 +52,65 @@ def fit_width_model(tracks):
     A = np.vstack([np.array(ys), np.ones(len(ys))]).T
     coef, *_ = np.linalg.lstsq(A, np.array(ws), rcond=None)
     return coef
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--tracks", required=True)
+    p.add_argument("--video", required=True)
+    p.add_argument("--out-tracks", required=True)
+    p.add_argument("--width-ratio", type=float, default=1.5,
+                   help="flag boxes this many times wider than expected for their court position")
+    p.add_argument("--min-team-conf", type=float, default=0.18,
+                   help="how strongly each half must read as a kit before we trust the disagreement")
+    args = p.parse_args()
+
+    data = json.load(open(args.tracks))
+    tracks = data["tracks"]
+    coef = fit_width_model(tracks)
+    print(f"width model: w = {coef[0]:.4f}*foot_y + {coef[1]:.1f}")
+
+    by_frame = {}
+    for tid, fb in tracks.items():
+        for f, box in fb.items():
+            by_frame.setdefault(int(f), []).append((tid, box))
+
+    cap = cv2.VideoCapture(args.video)
+    removed, kept, fi = 0, 0, 0
+    drop = {}
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        for tid, box in by_frame.get(fi, []):
+            expected = coef[0] * box[3] + coef[1]
+            too_wide = (box[2] - box[0]) > args.width_ratio * max(1.0, expected)
+            if not too_wide:
+                kept += 1
+                continue
+            reads = half_teams(frame, box)
+            if not reads:
+                kept += 1
+                continue
+            (lc, lw), (rc, rw) = reads
+            left = "C" if lc > lw else "W"
+            right = "C" if rc > rw else "W"
+            confident = min(max(lc, lw), max(rc, rw)) > args.min_team_conf
+            if left != right and confident:
+                drop.setdefault(tid, set()).add(str(fi))
+                removed += 1
+            else:
+                kept += 1
+        fi += 1
+    cap.release()
+
+    for tid, frames in drop.items():
+        for f in frames:
+            tracks[tid].pop(f, None)
+    tracks = {t: fb for t, fb in tracks.items() if fb}
+    data["tracks"] = tracks
+    data["teams"] = {t: v for t, v in data["teams"].items() if t in tracks}
+    json.dump(data, open(args.out_tracks, "w"))
+    print(f"removed {removed} two-player boxes, kept {kept} "
+          f"({100 * removed / max(1, removed + kept):.1f}% removed)")
+    print(f"wrote {args.out_tracks}")
