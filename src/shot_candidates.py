@@ -282,3 +282,253 @@ def pick_temporal_ball_candidate(
             }
 
     return best
+
+
+def score_frame_peak(image: np.ndarray) -> Dict[str, Any] | None:
+    rim_candidates = rim_candidates_from_lanes(image)
+    balls = orange_candidates(image)
+    if not rim_candidates or not balls:
+        return None
+
+    best: Dict[str, Any] | None = None
+    for ball in balls:
+        ball_x, ball_y = ball["center"]
+        for lane in rim_candidates:
+            rim_x, rim_y = lane["rim_px"]
+            dx = ball_x - rim_x
+            dy = ball_y - rim_y
+            abs_dx = abs(dx)
+            abs_dy = abs(dy)
+            if abs_dx > 44.0:
+                continue
+            if dy < -64.0 or dy > 36.0:
+                continue
+
+            vertical_bonus = max(0.0, 42.0 - abs(dy - 4.0))
+            horizontal_bonus = max(0.0, 54.0 - abs_dx * 1.2)
+            contact_bonus = 18.0 if -20.0 <= dy <= 24.0 else 0.0
+            score = (
+                lane["lane_score"] * 0.006
+                + ball["area"] * 3.0
+                + ball["circularity"] * 65.0
+                + horizontal_bonus
+                + max(0.0, 44.0 - abs_dy * 1.05)
+                + vertical_bonus
+                + contact_bonus
+            )
+            if best is None or score > best["score"]:
+                best = {
+                    "score": float(score),
+                    "ball": ball,
+                    "lane": lane,
+                    "dx": float(dx),
+                    "dy": float(dy),
+                }
+
+    return best
+
+
+def release_pixel_from_ball(
+    image: np.ndarray,
+    peak: Dict[str, Any],
+    release_ball_x: float,
+    release_ball_y: float,
+) -> tuple[float, float]:
+    h, w = image.shape[:2]
+    rim_x, rim_y = peak["lane"]["rim_px"]
+    release_x = float(release_ball_x) * 0.84 + rim_x * 0.16
+    release_y = float(release_ball_y) + h * 0.11
+    release_x = max(0.0, min(float(w - 1), release_x))
+    release_y = max(0.0, min(float(h - 1), release_y))
+    return release_x, release_y
+
+
+def backtrack_release_frame(
+    capture: cv2.VideoCapture,
+    *,
+    peak_timestamp: float,
+    duration_s: float,
+    peak: Dict[str, Any],
+    fallback_release_offset_s: float,
+) -> tuple[float, np.ndarray, tuple[float, float]]:
+    rim_x, rim_y = peak["lane"]["rim_px"]
+    peak_ball_x, peak_ball_y = peak["ball"]["center"]
+    peak_distance = math.hypot(peak_ball_x - rim_x, peak_ball_y - rim_y)
+    side = peak["lane"]["side"]
+
+    best_release: Dict[str, Any] | None = None
+    for offset_s in (0.20, 0.35, 0.50, 0.65, 0.80, 0.95):
+        release_timestamp = max(0.0, min(duration_s, peak_timestamp - offset_s))
+        frame = read_frame_at(capture, release_timestamp)
+        if frame is None:
+            continue
+
+        for candidate in orange_candidates(frame):
+            x, y = candidate["center"]
+            if abs(x - rim_x) > 180.0 or abs(y - rim_y) > 180.0:
+                continue
+            if side == "right" and x > rim_x + 35.0:
+                continue
+            if side == "left" and x < rim_x - 35.0:
+                continue
+
+            distance_to_rim = math.hypot(x - rim_x, y - rim_y)
+            if distance_to_rim < peak_distance + 12.0:
+                continue
+
+            score = (
+                -abs(distance_to_rim - 88.0) * 1.6
+                + offset_s * 14.0
+                + candidate["circularity"] * 10.0
+                + candidate["area"] * 0.3
+            )
+            if best_release is None or score > best_release["score"]:
+                best_release = {
+                    "timestamp": release_timestamp,
+                    "frame": frame.copy(),
+                    "ball_center": (float(x), float(y)),
+                    "score": float(score),
+                }
+
+    if best_release is not None:
+        return best_release["timestamp"], best_release["frame"], best_release["ball_center"]
+
+    release_timestamp = max(0.0, min(duration_s, peak_timestamp - fallback_release_offset_s))
+    frame = read_frame_at(capture, release_timestamp)
+    if frame is None:
+        raise RuntimeError("Could not read the fallback release frame.")
+
+    fallback_ball = peak["ball"]["center"]
+    best_distance = None
+    for candidate in orange_candidates(frame):
+        x, y = candidate["center"]
+        distance = abs(x - fallback_ball[0]) + abs(y - fallback_ball[1])
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            fallback_ball = (float(x), float(y))
+
+    return release_timestamp, frame, (float(fallback_ball[0]), float(fallback_ball[1]))
+
+
+def has_shot_trajectory(
+    capture: cv2.VideoCapture,
+    *,
+    peak_timestamp: float,
+    duration_s: float,
+    peak: Dict[str, Any],
+    release_timestamp: float,
+    release_ball_center: tuple[float, float],
+) -> bool:
+    rim_x, rim_y = peak["lane"]["rim_px"]
+    side = peak["lane"]["side"]
+    peak_ball_x, peak_ball_y = peak["ball"]["center"]
+    peak_distance = math.hypot(peak_ball_x - rim_x, peak_ball_y - rim_y)
+    release_distance = math.hypot(release_ball_center[0] - rim_x, release_ball_center[1] - rim_y)
+
+    if peak_distance > MAX_PEAK_RIM_DISTANCE_PX:
+        return False
+    if release_distance < max(MIN_RELEASE_RIM_DISTANCE_PX, peak_distance + MIN_APPROACH_DELTA_PX):
+        return False
+
+    delta_t = peak_timestamp - release_timestamp
+    if delta_t < 0.18:
+        return False
+
+    release_entry = {
+        "timestamp": float(release_timestamp),
+        "center": (float(release_ball_center[0]), float(release_ball_center[1])),
+        "distance_to_rim": float(release_distance),
+    }
+    peak_entry = {
+        "timestamp": float(peak_timestamp),
+        "center": (float(peak_ball_x), float(peak_ball_y)),
+        "distance_to_rim": float(peak_distance),
+    }
+
+    reference_center = peak_entry["center"]
+    midpoint_entries: List[Dict[str, Any]] = []
+    for progress in sorted(TEMPORAL_MIDPOINTS, reverse=True):
+        midpoint_timestamp = release_timestamp + delta_t * progress
+        midpoint_timestamp = max(0.0, min(duration_s, midpoint_timestamp))
+        frame = read_frame_at(capture, midpoint_timestamp)
+        if frame is None:
+            continue
+
+        target_distance = release_distance + (peak_distance - release_distance) * progress
+        midpoint = pick_temporal_ball_candidate(
+            frame,
+            rim_x=rim_x,
+            rim_y=rim_y,
+            side=side,
+            target_distance=float(target_distance),
+            min_distance=float(peak_distance + 6.0),
+            max_distance=float(release_distance + 24.0),
+            reference_center=reference_center,
+        )
+        if midpoint is None:
+            continue
+
+        midpoint_entries.append(
+            {
+                "timestamp": float(midpoint_timestamp),
+                "center": midpoint["center"],
+                "distance_to_rim": midpoint["distance_to_rim"],
+            }
+        )
+        reference_center = midpoint["center"]
+
+    if len(midpoint_entries) < 2:
+        return False
+
+    sequence = [release_entry, *sorted(midpoint_entries, key=lambda item: item["timestamp"]), peak_entry]
+    approach_steps = 0
+    for previous, current in zip(sequence, sequence[1:]):
+        if current["distance_to_rim"] <= previous["distance_to_rim"] - 8.0:
+            approach_steps += 1
+
+    if approach_steps < len(sequence) - 1:
+        return False
+
+    post_timestamp = min(duration_s, peak_timestamp + min(0.25, delta_t * 0.4))
+    post_frame = read_frame_at(capture, post_timestamp)
+    if post_frame is None:
+        return True
+
+    post_candidate = pick_temporal_ball_candidate(
+        post_frame,
+        rim_x=rim_x,
+        rim_y=rim_y,
+        side=side,
+        target_distance=float(max(peak_distance + 18.0, 55.0)),
+        min_distance=float(peak_distance + 4.0),
+        max_distance=float(release_distance + 24.0),
+        reference_center=peak_entry["center"],
+    )
+    return post_candidate is not None or delta_t >= 0.55
+
+
+def select_temporal_peaks(
+    raw_candidates: List[Dict[str, Any]],
+    min_score: float,
+    suppression_window_s: float,
+    max_candidates: int,
+) -> List[Dict[str, Any]]:
+    eligible = [candidate for candidate in raw_candidates if candidate["score"] >= min_score]
+    eligible.sort(key=lambda candidate: candidate["score"], reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    for candidate in eligible:
+        candidate_time = candidate["peak_timestamp"]
+        if all(abs(candidate_time - chosen["peak_timestamp"]) >= suppression_window_s for chosen in selected):
+            selected.append(candidate)
+        if len(selected) >= max_candidates:
+            break
+
+    selected.sort(key=lambda candidate: candidate["peak_timestamp"])
+    return selected
+
+
+def candidate_rim_distance(candidate: Dict[str, Any]) -> float:
+    rim_x, rim_y = candidate["lane"]["rim_px"]
+    ball_x, ball_y = candidate["ball"]["center"]
+    return float(math.hypot(ball_x - rim_x, ball_y - rim_y))
