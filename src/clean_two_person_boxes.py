@@ -114,3 +114,7 @@ def main():
     print(f"removed {removed} two-player boxes, kept {kept} "
           f"({100 * removed / max(1, removed + kept):.1f}% removed)")
     print(f"wrote {args.out_tracks}")
+
+
+if __name__ == "__main__":
+    main()
