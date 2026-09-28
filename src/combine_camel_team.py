@@ -147,3 +147,7 @@ def main():
     cap.release()
     writer.release()
     print(f"saved -> {args.out}")
+
+
+if __name__ == "__main__":
+    main()
