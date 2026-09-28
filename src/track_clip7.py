@@ -224,3 +224,29 @@ def color_histogram(frame, box):
     hist = cv2.calcHist([hsv], [0, 1, 2], None, [16, 8, 8], [0, 180, 0, 256, 0, 256])
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist.flatten()
+
+def appearance_signature(frame, box):
+    x1, y1, x2, y2 = [int(v) for v in box]
+    x1, y1 = max(x1, 0), max(y1, 0)
+    x2, y2 = min(x2, frame.shape[1]-1), min(y2, frame.shape[0]-1)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    patch = frame[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist
+
+def appearance_distance(sig_a, sig_b):
+    if sig_a is None or sig_b is None:
+        return 0.5
+    return cv2.compareHist(sig_a, sig_b, cv2.HISTCMP_BHATTACHARYYA)
+
+def box_iou(a, b):
+    x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inter = (x2-x1) * (y2-y1)
+    area_a = (a[2]-a[0]) * (a[3]-a[1]); area_b = (b[2]-b[0]) * (b[3]-b[1])
+    return inter / (area_a + area_b - inter)
