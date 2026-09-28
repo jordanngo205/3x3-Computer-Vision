@@ -129,14 +129,6 @@ def team_of(frame, box):
     return "C" if col > wht else "W"
 
 
-def team_of_feat(score, split=0.0, band=0.15):
-    """Coloured kit or white, from the torso score. The threshold is fixed here;
-    it later had to be learned per clip, because lighting moves every score."""
-    if score is None:
-        return "?"
-    return "C" if score > split + band else ("W" if score < split - band else "?")
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--video", required=True)
@@ -296,6 +288,30 @@ def main():
             for (f, d), a, b in zip(seq, sx, sy):
                 d["cx"], d["cy"] = float(a), float(b)
 
+    # learn the two kits from every torso patch in the clip at once, then label
+    # each detection by which kit it is closer to. Because the clusters are fit
+    # on thousands of patches, a short or broken track no longer causes a colour
+    # to flip - which per-track voting could not fix.
+    # Find where the two kits actually split in THIS clip rather than using a
+    # fixed number. Thresholds tuned on one 22s clip failed on a 54s clip from
+    # the same game - lighting moved the scores enough to flip white to red.
+    # A 1-D two-means on the scores adapts to whatever the footage looks like.
+    scores = [d["feat"] for ds in detections.values() for d in ds if d.get("feat") is not None]
+    if len(scores) >= 30:
+        a = np.array(sorted(scores))
+        lo, hi = a[len(a) // 10], a[-len(a) // 10]      # robust starting points
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            left, right = a[a < mid], a[a >= mid]
+            if not len(left) or not len(right):
+                break
+            lo, hi = left.mean(), right.mean()
+        split = (lo + hi) / 2
+        band = 0.06                                     # scores this close to the split are unclear
+        print(f"kit split learned from this clip: {split:+.2f}")
+    else:
+        split, band = 0.0, 0.15
+
     # Fill brief dropouts. A player missed for a frame or two reads as the dot
     # flickering; interpolating between two real observations is safe because it
     # is anchored at both ends. Long gaps are left empty rather than invented.
@@ -322,15 +338,47 @@ def main():
                         "kp": da["kp"], "pt": da["pt"], "box": da["box"],
                         "feat": da.get("feat"), "tid": tid, "filled": True})
 
-    # settle each track on one kit by voting its per-frame calls: a single
-    # frame's torso patch is far too noisy to trust on its own
-    per_track = {}
+    # Smooth each track's redness score before deciding anything. Smoothing the
+    # score keeps the per-frame 3/3 constraint intact, whereas voting on the
+    # labels afterwards overrode it and put the counts back out (46% vs 100%).
+    by_track = {}
     for f, ds in detections.items():
         for d in ds:
-            t = team_of_feat(d.get("feat"))
-            d["team"] = t
-            if t in ("C", "W"):
-                per_track.setdefault(d.get("tid"), []).append(t)
+            if d.get("feat") is not None:
+                by_track.setdefault(d.get("tid"), []).append((f, d))
+    for tid, seq in by_track.items():
+        seq.sort(key=lambda t: t[0])
+        vals = np.array([d["feat"] for _, d in seq], dtype=float)
+        w = min(len(vals), 9)
+        if w >= 3:
+            pad = w // 2
+            sm = np.convolve(np.pad(vals, pad, mode="edge"), np.ones(w) / w, mode="valid")[:len(vals)]
+            for (_, d), v in zip(seq, sm):
+                d["feat"] = float(v)
+
+    # Use the rule of the game: it is 3-on-3, so when six players are on court
+    # exactly three of them are in each kit. Ranking the six by how red they are
+    # and splitting 3/3 is far stronger than judging each one against a
+    # threshold, because it only needs the ORDER to be right, not the absolute
+    # score - and the order survives lighting changes that move every score at
+    # once.
+    per_track = {}
+    for f, ds in detections.items():
+        scored = [d for d in ds if d.get("feat") is not None]
+        if len(scored) == 6:
+            order = sorted(scored, key=lambda d: -d["feat"])
+            for i, d in enumerate(order):
+                d["team"] = "C" if i < 3 else "W"
+        else:
+            for d in ds:
+                sc = d.get("feat")
+                if sc is None:
+                    d["team"] = "?"
+                    continue
+                d["team"] = "C" if sc > split + band else ("W" if sc < split - band else "?")
+        for d in ds:
+            if d.get("team") in ("C", "W"):
+                per_track.setdefault(d.get("tid"), []).append(d["team"])
     settled = {}
     for tid, labs in per_track.items():
         c, w = labs.count("C"), labs.count("W")
