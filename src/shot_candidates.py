@@ -688,3 +688,247 @@ def pick_release_from_sampled_sequence(
         return None
 
     return release_candidate
+
+
+def collect_sampled_frames(
+    video_path: Path,
+    *,
+    duration_s: float,
+    scan_step_s: float,
+    target_timestamps: List[float],
+) -> Dict[float, np.ndarray]:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 1.0:
+        fps = 30.0
+    sample_every = max(1, int(round(scan_step_s * fps)))
+    target_keys = {round(float(timestamp), 3) for timestamp in target_timestamps}
+
+    frames: Dict[float, np.ndarray] = {}
+    frame_index = 0
+    while True:
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            break
+
+        timestamp_s = float(capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+        if timestamp_s > duration_s + 1e-9:
+            break
+
+        if frame_index % sample_every == 0:
+            key = round(float(timestamp_s), 3)
+            if key in target_keys:
+                frames[key] = frame.copy()
+                if len(frames) == len(target_keys):
+                    break
+        frame_index += 1
+
+    capture.release()
+    return frames
+
+
+def write_candidate_rows(path: Path, rows: List[Dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CANDIDATE_FIELDNAMES)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in CANDIDATE_FIELDNAMES})
+
+
+def read_candidate_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def candidate_rows_to_events(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    event_rows: List[Dict[str, str]] = []
+    for row in rows:
+        event_rows.append(
+            {
+                "timestamp": row.get("timestamp", ""),
+                "frame_image": row.get("frame_image", ""),
+                "label": row.get("label", ""),
+                "pixel_x": row.get("pixel_x", ""),
+                "pixel_y": row.get("pixel_y", ""),
+                "result": row.get("result", ""),
+                "play_type": row.get("play_type", "other") or "other",
+                "notes": row.get("notes", ""),
+            }
+        )
+    return event_rows
+
+
+def mine_shot_candidates(
+    *,
+    root: Path,
+    video_path: Path,
+    duration_s: float,
+    out_csv: Path,
+    frame_dir: Path,
+    calibration_matrix_path: Path | None = None,
+    scan_step_s: float = SCAN_STEP_S,
+    min_score: float = MIN_CANDIDATE_SCORE,
+    suppression_window_s: float = SUPPRESSION_WINDOW_S,
+    release_offset_s: float = RELEASE_OFFSET_S,
+    max_candidates: int = MAX_CANDIDATES,
+) -> List[Dict[str, str]]:
+    video_path = video_path.expanduser().resolve()
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    raw_candidates: List[Dict[str, Any]] = []
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 1.0:
+        fps = 30.0
+    sample_every = max(1, int(round(scan_step_s * fps)))
+    frame_index = 0
+    while True:
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            break
+
+        timestamp_s = float(capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+        if timestamp_s > duration_s + 1e-9:
+            break
+
+        if frame_index % sample_every == 0:
+            scored = score_frame_peak(frame)
+            if scored is not None:
+                raw_candidates.append(
+                    {
+                        "peak_timestamp": round(float(timestamp_s), 3),
+                        "score": float(scored["score"]),
+                        "ball": scored["ball"],
+                        "lane": scored["lane"],
+                    }
+                )
+        frame_index += 1
+
+    clustered_candidates: List[Dict[str, Any]] = []
+    for cluster in cluster_raw_candidates(raw_candidates, scan_step_s):
+        shot = pick_shot_from_cluster(cluster, scan_step_s=scan_step_s)
+        if shot is None:
+            continue
+
+        peak_candidate = {
+            **shot["peak_candidate"],
+            "score": float(shot["cluster_score"]),
+        }
+        clustered_candidates.append(
+            {
+                **peak_candidate,
+                "release_timestamp": float(shot["release_candidate"]["peak_timestamp"]),
+                "release_ball_center": tuple(shot["release_candidate"]["ball"]["center"]),
+            }
+        )
+
+    provisional_limit = max(max_candidates, max_candidates * TEMPORAL_PROVISIONAL_MULTIPLIER)
+    provisional = select_temporal_peaks(clustered_candidates, min_score, suppression_window_s, provisional_limit)
+    provisional.sort(key=lambda candidate: candidate["score"], reverse=True)
+    matrix = load_matrix(calibration_matrix_path)
+
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    for stale_frame in frame_dir.glob("candidate_*.png"):
+        stale_frame.unlink()
+
+    validated = provisional[:max_candidates]
+    validated.sort(key=lambda candidate: candidate["peak_timestamp"])
+    sampled_frames = collect_sampled_frames(
+        video_path,
+        duration_s=duration_s,
+        scan_step_s=scan_step_s,
+        target_timestamps=[float(candidate["release_timestamp"]) for candidate in validated],
+    )
+    rows: List[Dict[str, str]] = []
+    for index, candidate in enumerate(validated, start=1):
+        peak_timestamp = float(candidate["peak_timestamp"])
+        release_timestamp = float(candidate["release_timestamp"])
+        release_frame = sampled_frames.get(round(release_timestamp, 3))
+        if release_frame is None:
+            continue
+        release_ball_center = candidate["release_ball_center"]
+
+        release_x, release_y = release_pixel_from_ball(
+            release_frame,
+            candidate,
+            release_ball_center[0],
+            release_ball_center[1],
+        )
+        frame_path = frame_dir / f"candidate_{index:03d}_{release_timestamp:06.2f}s.png"
+        cv2.imwrite(str(frame_path), release_frame)
+
+        row: Dict[str, str] = {
+            "timestamp": f"{release_timestamp:.2f}",
+            "frame_image": str(frame_path.relative_to(root)),
+            "label": f"auto_shot_{index:03d}",
+            "pixel_x": f"{release_x:.1f}",
+            "pixel_y": f"{release_y:.1f}",
+            "result": "",
+            "play_type": "other",
+            "notes": (
+                f"Auto candidate mined from a rim-zone ball peak at {peak_timestamp:.2f}s "
+                f"(score {candidate['score']:.1f})."
+            ),
+            "score": f"{candidate['score']:.1f}",
+            "peak_timestamp": f"{peak_timestamp:.2f}",
+            "peak_ball_x": f"{candidate['ball']['center'][0]:.1f}",
+            "peak_ball_y": f"{candidate['ball']['center'][1]:.1f}",
+            "peak_board_x": f"{candidate['lane']['rim_px'][0]:.1f}",
+            "peak_board_y": f"{candidate['lane']['rim_px'][1]:.1f}",
+            "peak_side": str(candidate["lane"]["side"]),
+            "court_x_ft": "",
+            "court_y_ft": "",
+            "in_bounds": "",
+        }
+
+        if matrix is not None:
+            court_x_ft, court_y_ft, in_bounds = project_pixel(matrix, release_x, release_y)
+            row["court_x_ft"] = f"{court_x_ft:.3f}"
+            row["court_y_ft"] = f"{court_y_ft:.3f}"
+            row["in_bounds"] = "true" if in_bounds else "false"
+
+        rows.append(row)
+
+    capture.release()
+    write_candidate_rows(out_csv, rows)
+    return rows
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Mine provisional shot candidates from a basketball clip.")
+    parser.add_argument("--root", default=".", help="Project root for relative media paths.")
+    parser.add_argument("--video", required=True, help="Path to the source video.")
+    parser.add_argument("--duration", required=True, type=float, help="Clip duration in seconds.")
+    parser.add_argument("--out-csv", required=True, help="Output CSV path.")
+    parser.add_argument("--frame-dir", required=True, help="Directory for saved candidate frame images.")
+    parser.add_argument("--calibration-matrix", help="Optional calibration matrix JSON for projected court coordinates.")
+    parser.add_argument("--scan-step", type=float, default=SCAN_STEP_S)
+    parser.add_argument("--min-score", type=float, default=MIN_CANDIDATE_SCORE)
+    parser.add_argument("--suppression-window", type=float, default=SUPPRESSION_WINDOW_S)
+    parser.add_argument("--release-offset", type=float, default=RELEASE_OFFSET_S)
+    parser.add_argument("--max-candidates", type=int, default=MAX_CANDIDATES)
+    args = parser.parse_args()
+
+    rows = mine_shot_candidates(
+        root=Path(args.root).expanduser().resolve(),
+        video_path=Path(args.video).expanduser().resolve(),
+        duration_s=float(args.duration),
+        out_csv=Path(args.out_csv).expanduser().resolve(),
+        frame_dir=Path(args.frame_dir).expanduser().resolve(),
+        calibration_matrix_path=None
+        if not args.calibration_matrix
+        else Path(args.calibration_matrix).expanduser().resolve(),
+        scan_step_s=float(args.scan_step),
+        min_score=float(args.min_score),
+        suppression_window_s=float(args.suppression_window),
+        release_offset_s=float(args.release_offset),
+        max_candidates=int(args.max_candidates),
+    )
+    print(json.dumps(rows, indent=2))
