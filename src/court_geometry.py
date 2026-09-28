@@ -56,3 +56,85 @@ def court_image_size(scale_px_per_ft: float, margin_px: int) -> Tuple[int, int]:
 def feet_to_pixels(point_ft: Tuple[float, float], scale_px_per_ft: float, margin_px: int) -> Tuple[float, float]:
     x_ft, y_ft = point_ft
     return margin_px + x_ft * scale_px_per_ft, margin_px + y_ft * scale_px_per_ft
+
+
+def draw_court(
+    scale_px_per_ft: float = 20.0,
+    margin_px: int = 40,
+    annotate_landmarks: bool = True,
+) -> Image.Image:
+    image = Image.new("RGB", court_image_size(scale_px_per_ft, margin_px), "#f7f2e8")
+    draw = ImageDraw.Draw(image)
+
+    def rect(a_ft: Tuple[float, float], b_ft: Tuple[float, float], color: str, width: int = 3) -> None:
+        ax, ay = feet_to_pixels(a_ft, scale_px_per_ft, margin_px)
+        bx, by = feet_to_pixels(b_ft, scale_px_per_ft, margin_px)
+        draw.rectangle([ax, ay, bx, by], outline=color, width=width)
+
+    def line(a_ft: Tuple[float, float], b_ft: Tuple[float, float], color: str, width: int = 3) -> None:
+        ax, ay = feet_to_pixels(a_ft, scale_px_per_ft, margin_px)
+        bx, by = feet_to_pixels(b_ft, scale_px_per_ft, margin_px)
+        draw.line([ax, ay, bx, by], fill=color, width=width)
+
+    def circle(center_ft: Tuple[float, float], radius_ft: float, color: str, width: int = 3) -> None:
+        cx, cy = feet_to_pixels(center_ft, scale_px_per_ft, margin_px)
+        radius_px = radius_ft * scale_px_per_ft
+        draw.ellipse(
+            [cx - radius_px, cy - radius_px, cx + radius_px, cy + radius_px],
+            outline=color,
+            width=width,
+        )
+
+    lane_top = (COURT_WIDTH_FT - LANE_WIDTH_FT) / 2.0
+    lane_bottom = lane_top + LANE_WIDTH_FT
+    court_line = "#151515"
+    accent = "#b42222"
+
+    rect((0.0, 0.0), (COURT_LENGTH_FT, COURT_WIDTH_FT), court_line, width=4)
+    line((COURT_LENGTH_FT / 2.0, 0.0), (COURT_LENGTH_FT / 2.0, COURT_WIDTH_FT), court_line)
+    circle((COURT_LENGTH_FT / 2.0, COURT_WIDTH_FT / 2.0), CENTER_CIRCLE_RADIUS_FT, court_line)
+
+    rect((0.0, lane_top), (FREE_THROW_LINE_FROM_BASELINE_FT, lane_bottom), court_line)
+    rect(
+        (COURT_LENGTH_FT - FREE_THROW_LINE_FROM_BASELINE_FT, lane_top),
+        (COURT_LENGTH_FT, lane_bottom),
+        court_line,
+    )
+    circle((FREE_THROW_LINE_FROM_BASELINE_FT, COURT_WIDTH_FT / 2.0), CENTER_CIRCLE_RADIUS_FT, court_line)
+    circle((COURT_LENGTH_FT - FREE_THROW_LINE_FROM_BASELINE_FT, COURT_WIDTH_FT / 2.0), CENTER_CIRCLE_RADIUS_FT, court_line)
+
+    line(
+        (BACKBOARD_OFFSET_FROM_BASELINE_FT, COURT_WIDTH_FT / 2.0 - BACKBOARD_HALF_WIDTH_FT),
+        (BACKBOARD_OFFSET_FROM_BASELINE_FT, COURT_WIDTH_FT / 2.0 + BACKBOARD_HALF_WIDTH_FT),
+        accent,
+    )
+    line(
+        (COURT_LENGTH_FT - BACKBOARD_OFFSET_FROM_BASELINE_FT, COURT_WIDTH_FT / 2.0 - BACKBOARD_HALF_WIDTH_FT),
+        (COURT_LENGTH_FT - BACKBOARD_OFFSET_FROM_BASELINE_FT, COURT_WIDTH_FT / 2.0 + BACKBOARD_HALF_WIDTH_FT),
+        accent,
+    )
+    circle((RIM_OFFSET_FROM_BASELINE_FT, COURT_WIDTH_FT / 2.0), RIM_RADIUS_FT, accent)
+    circle((COURT_LENGTH_FT - RIM_OFFSET_FROM_BASELINE_FT, COURT_WIDTH_FT / 2.0), RIM_RADIUS_FT, accent)
+
+    if annotate_landmarks:
+        for name, point_ft in landmark_points_ft().items():
+            px, py = feet_to_pixels(point_ft, scale_px_per_ft, margin_px)
+            dot = 5
+            draw.ellipse([px - dot, py - dot, px + dot, py + dot], fill=accent, outline=accent)
+            draw.text((px + 8, py - 8), name, fill=accent)
+
+    return image
+
+
+def write_landmark_file(path: Path) -> None:
+    payload = {
+        "court_length_ft": COURT_LENGTH_FT,
+        "court_width_ft": COURT_WIDTH_FT,
+        "landmarks_ft": {name: [point[0], point[1]] for name, point in landmark_points_ft().items()},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def load_landmark_names() -> Iterable[str]:
+    return landmark_points_ft().keys()
