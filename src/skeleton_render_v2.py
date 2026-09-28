@@ -229,3 +229,7 @@ def main():
     print(f"\ndone. {n_frames} frames -> {out_path}")
     print(f"detected {raw_total/max(1,n_frames):.1f}/frame, "
           f"drawn {shown/max(1,n_frames):.1f}/frame ({n_filled} interpolated)")
+
+
+if __name__ == "__main__":
+    main()
