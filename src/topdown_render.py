@@ -146,6 +146,8 @@ def main():
     p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--imgsz", type=int, default=1280)
     p.add_argument("--save-positions", default=None)
+    p.add_argument("--no-track-vote", action="store_true",
+                   help="keep the per-frame kit call instead of settling each track on one kit")
     p.add_argument("--all-cameras", action="store_true",
                    help="process every frame, including shots from other cameras the calibration "
                         "does not apply to")
@@ -179,6 +181,14 @@ def main():
     def to_court(pt):
         return cv2.perspectiveTransform(np.array([[pt]], dtype=np.float32), H).reshape(2)
 
+    def box_iou(a, b):
+        x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        i = (x2 - x1) * (y2 - y1)
+        return i / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - i)
+
     cap = cv2.VideoCapture(args.video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     vw, vh = int(cap.get(3)), int(cap.get(4))
@@ -189,6 +199,10 @@ def main():
     COLS = {"C": (60, 60, 235), "W": (235, 235, 235), "?": (120, 160, 120)}
     positions, fi, on_court_total = {}, 0, 0
 
+    # link detections frame to frame so the kit colour can be voted over a
+    # player's whole run - a single frame's torso patch is far too noisy, which
+    # is why the labels were flickering between red and white
+    tracks, votes, next_id = {}, {}, 0
     n_refs = [0]
     detections = {}
 
@@ -224,6 +238,31 @@ def main():
             here.append({"box": box, "kp": kps[i], "pt": pt, "cx": float(cx), "cy": float(cy),
                          "feat": torso_feature(frame, box)})
 
+        # link detections frame to frame by box overlap, purely to accumulate
+        # colour votes along one player's run
+        used = set()
+        for tid in list(tracks):
+            best, bi = 0.25, None
+            for j, d in enumerate(here):
+                if j in used:
+                    continue
+                v = box_iou(tracks[tid]["box"], d["box"])
+                if v > best:
+                    best, bi = v, j
+            if bi is None:
+                tracks[tid]["missed"] += 1
+                if tracks[tid]["missed"] > 20:
+                    tracks.pop(tid)
+            else:
+                tracks[tid] = {"box": here[bi]["box"], "missed": 0}
+                here[bi]["tid"] = tid
+                used.add(bi)
+        for j, d in enumerate(here):
+            if "tid" not in d:
+                tracks[next_id] = {"box": d["box"], "missed": 0}
+                d["tid"] = next_id
+                next_id += 1
+
         detections[fi] = here
         on_court_total += len(here)
         fi += 1
@@ -231,9 +270,24 @@ def main():
             print(f"frame {fi}: {len(here)} on court", flush=True)
     cap.release()
 
+    # settle each track on one kit by voting its per-frame calls: a single
+    # frame's torso patch is far too noisy to trust on its own
+    per_track = {}
     for f, ds in detections.items():
         for d in ds:
-            d["team"] = team_of_feat(d.get("feat"))
+            t = team_of_feat(d.get("feat"))
+            d["team"] = t
+            if t in ("C", "W"):
+                per_track.setdefault(d.get("tid"), []).append(t)
+    settled = {}
+    for tid, labs in per_track.items():
+        c, w = labs.count("C"), labs.count("W")
+        settled[tid] = "C" if c > w else ("W" if w > c else "?")
+    if not args.no_track_vote:
+        for f, ds in detections.items():
+            for d in ds:
+                if d.get("tid") in settled:
+                    d["team"] = settled[d["tid"]]
 
     n_c = sum(1 for ds in detections.values() for d in ds if d.get("team") == "C")
     n_w = sum(1 for ds in detections.values() for d in ds if d.get("team") == "W")
@@ -256,7 +310,7 @@ def main():
         for d in detections.get(fi, []):
             t = d.get("team", "?")
             col = COLS[t]
-            frame_pts.append({"x": d["cx"], "y": d["cy"], "team": t})
+            frame_pts.append({"x": d["cx"], "y": d["cy"], "team": t, "track": d.get("tid")})
             k = d["kp"]
             for a, b in EDGES:
                 xa, ya = k[a][:2]; xb, yb = k[b][:2]
