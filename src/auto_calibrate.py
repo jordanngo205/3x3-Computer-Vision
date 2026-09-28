@@ -215,3 +215,103 @@ def find_lane_candidate(image: np.ndarray) -> Dict[str, Any] | None:
                 best = candidate
 
     return best
+
+
+def write_debug_overlay(image: np.ndarray, candidate: Dict[str, Any], output_path: Path) -> None:
+    overlay = image.copy()
+    quad = np.asarray(candidate["quad"], dtype=np.int32).reshape(-1, 1, 2)
+    cv2.polylines(overlay, [quad], True, (0, 255, 0), 3)
+    for index, point in enumerate(candidate["quad"]):
+        x, y = int(point[0]), int(point[1])
+        cv2.circle(overlay, (x, y), 6, (255, 80, 80), -1)
+        cv2.putText(
+            overlay,
+            str(index),
+            (x + 8, y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), overlay)
+
+
+def calibration_payload(video_name: str, frame_image: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    names = lane_landmark_names(candidate["side"])
+    landmarks_px = {
+        name: [round(float(point[0]), 2), round(float(point[1]), 2)]
+        for name, point in zip(names, candidate["quad"])
+    }
+    return {
+        "video": video_name,
+        "frame_image": frame_image,
+        "landmarks_px": landmarks_px,
+        "auto_calibration": {
+            "method": "dark_paint_contour",
+            "score": round(float(candidate["score"]), 2),
+            "side": candidate["side"],
+            "bbox": candidate["bbox"],
+            "threshold_vmax": candidate["threshold_vmax"],
+        },
+    }
+
+
+def auto_calibrate_frames(
+    video_name: str,
+    frame_paths: Iterable[Path],
+    relative_frame_paths: Iterable[str] | None = None,
+    debug_dir: Path | None = None,
+) -> Dict[str, Any]:
+    relative_lookup = (
+        list(relative_frame_paths)
+        if relative_frame_paths is not None
+        else [str(path) for path in frame_paths]
+    )
+    best_payload: Dict[str, Any] | None = None
+    best_candidate: Dict[str, Any] | None = None
+    best_frame_path: Path | None = None
+
+    for frame_path, relative_frame_path in zip(frame_paths, relative_lookup):
+        image = cv2.imread(str(frame_path))
+        if image is None:
+            continue
+        candidate = find_lane_candidate(image)
+        if candidate is None:
+            continue
+        payload = calibration_payload(video_name, relative_frame_path, candidate)
+        if best_candidate is None or candidate["score"] > best_candidate["score"]:
+            best_candidate = candidate
+            best_payload = payload
+            best_frame_path = frame_path
+
+    if best_payload is None or best_candidate is None or best_frame_path is None:
+        raise RuntimeError("Auto calibration could not find a usable painted key in the sampled frames.")
+
+    if debug_dir is not None:
+        image = cv2.imread(str(best_frame_path))
+        if image is not None:
+            write_debug_overlay(image, best_candidate, debug_dir / f"{best_frame_path.stem}_auto_calibration.png")
+
+    return best_payload
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Auto-calibrate a video by detecting the painted key.")
+    parser.add_argument("--video-name", required=True)
+    parser.add_argument("--frames", nargs="+", required=True, help="Absolute or relative paths to frame images.")
+    parser.add_argument("--frame-labels", nargs="*", help="Optional relative frame labels to store in calibration.")
+    parser.add_argument("--out", required=True, help="Calibration JSON output path.")
+    parser.add_argument("--debug-dir", help="Optional directory for debug overlays.")
+    args = parser.parse_args()
+
+    frame_paths = [Path(item).expanduser().resolve() for item in args.frames]
+    frame_labels = args.frame_labels if args.frame_labels else [str(path) for path in frame_paths]
+    debug_dir = Path(args.debug_dir).expanduser().resolve() if args.debug_dir else None
+    payload = auto_calibrate_frames(args.video_name, frame_paths, frame_labels, debug_dir=debug_dir)
+
+    out_path = Path(args.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(payload, indent=2))
