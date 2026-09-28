@@ -119,6 +119,8 @@ otherwise selects CPU, which is about 2.5x slower.
 
 ## Files
 
+The pipeline that produces the render above:
+
 | | |
 |---|---|
 | `src/topdown_render.py` | the pipeline — detection, tracking, merging, team assignment, rendering |
@@ -126,6 +128,45 @@ otherwise selects CPU, which is about 2.5x slower.
 | `src/track_botsort.py` | camera-shot detection, team-colour helpers |
 | `src/calibrate_court.py` | click tool for the four calibration points |
 | `court_calibration_long.json` | homography for `Canada v Ger Long.mov` |
+
+Calibration and court geometry:
+
+| | |
+|---|---|
+| `src/court_geometry.py` | FIBA 3x3 court constants |
+| `src/compute_calibration.py` | fit the homography from clicked points |
+| `src/auto_calibrate.py` | attempt calibration from detected court lines |
+| `src/validate_calibration.py` | reproject known points to check a calibration |
+| `labels_canger.txt` | 180 hand labels (player / referee / other) behind the depth cut |
+
+Earlier tracker iterations, kept because the README's results are measured against
+them. `track_clip7.py` is the hand-tuned v7 baseline the current pipeline replaced:
+
+| | |
+|---|---|
+| `src/simple_track.py` | minimal detect-and-track baseline |
+| `src/track_clip*.py` | v1–v7, each adding one idea (colour, court filter, merging, flip-splitting) |
+| `src/track_test*.py`, `src/audit_*.py` | held-out clips and identity-swap audits |
+
+Experiments that did not work out, kept so they are not retried — see
+"Measured dead ends" above:
+
+| | |
+|---|---|
+| `src/extract_pseudo_labels.py`, `src/train_embedding.py` | self-trained appearance embedding |
+| `src/validate_embedding_on_realtest.py` | the measurement that killed it |
+| `src/validate_color_clustering.py`, `src/validate_team_clustering.py` | kit-clustering checks |
+| `src/combine_camel_team.py` | CAMELTrack association plus our team reasoning |
+| `src/skeleton_render_v2.py` | tiled pose inference |
+
+Analysis built on the tracked positions:
+
+| | |
+|---|---|
+| `src/gravity.py` | nearest-defender distance, double-teams, paint occupancy |
+| `src/shot_candidates.py` | shot detection from pose and ball motion |
+| `src/project_events.py`, `src/render_shot_chart.py` | events to court coordinates, shot chart |
+| `src/app.py`, `src/video_library.py` | local review app for tagging clips |
 
 Source footage and model weights are not in the repo. `yolo11m-pose.pt` is downloaded
 automatically by ultralytics on first run.
