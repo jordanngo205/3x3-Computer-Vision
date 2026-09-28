@@ -12,6 +12,8 @@ the court grey and a red kit sit at the same hue.
 """
 import argparse
 import json
+import os
+import pickle
 
 import cv2
 import numpy as np
@@ -151,6 +153,11 @@ def main():
     p.add_argument("--device", default="mps",
                    help="torch device. Ultralytics was silently choosing CPU on this machine, "
                         "which is 2.5x slower than MPS for the same result.")
+    p.add_argument("--cache-detections", default=None,
+                   help="path to a .npz cache of detections+tracks+kit scores. Written if absent, "
+                        "read if present. Detection and tracking are the expensive part and do not "
+                        "depend on the team logic, so caching them turns a 1-hour experiment on the "
+                        "labelling into a 1-second one.")
     p.add_argument("--tracker", default="botsort.yaml",
                    help="ultralytics tracker config. BoT-SORT uses motion prediction and global "
                         "motion compensation for the panning camera, so a player keeps one id "
@@ -213,7 +220,20 @@ def main():
     n_refs = [0]
     detections = {}
 
-    while True:
+    cache = args.cache_detections
+    cached = cache and os.path.exists(cache)
+    if cached:
+        with open(cache, "rb") as fh:
+            blob = pickle.load(fh)
+        detections = blob["detections"]
+        n_refs[0] = blob["n_refs"]
+        on_court_total = blob["on_court_total"]
+        fi = blob["n_frames"]
+        cap.release()
+        print(f"loaded cached detections for {fi} frames from {cache} "
+              f"(skipping detection and tracking)")
+
+    while not cached:
         ok, frame = cap.read()
         if not ok:
             break
@@ -295,6 +315,12 @@ def main():
         if fi % 60 == 0:
             print(f"frame {fi}: {len(here)} on court", flush=True)
     cap.release()
+
+    if cache and not cached:
+        with open(cache, "wb") as fh:
+            pickle.dump({"detections": detections, "n_refs": n_refs[0],
+                         "on_court_total": on_court_total, "n_frames": fi}, fh)
+        print(f"cached detections -> {cache}")
 
     # smooth each track's court position over a short window. A single frame's
     # ankle keypoints jitter by a few pixels, and the homography turns that into
