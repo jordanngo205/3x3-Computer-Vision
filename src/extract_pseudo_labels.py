@@ -101,3 +101,76 @@ def extract_crops(tag, video_path, by_frame, out_dir):
     cap.release()
     print(f"  [{tag}] scanned {fidx} frames, saved {n_saved} crops")
     return crop_path_by_track_frame
+
+
+def build_positive_pairs(by_track, crop_lookup, tag):
+    rng = random.Random(RANDOM_SEED)
+    pairs = []
+    for tid, entries in by_track.items():
+        candidates = []
+        for i in range(len(entries)):
+            fi, _, _ = entries[i]
+            for j in range(i + 1, len(entries)):
+                fj, _, _ = entries[j]
+                gap = fj - fi
+                if gap > MAX_POSITIVE_GAP_FRAMES:
+                    break
+                key_i = (tid, fi)
+                key_j = (tid, fj)
+                if key_i in crop_lookup and key_j in crop_lookup:
+                    candidates.append((crop_lookup[key_i]["path"], crop_lookup[key_j]["path"]))
+        if len(candidates) > MAX_POSITIVES_PER_TRACK:
+            candidates = rng.sample(candidates, MAX_POSITIVES_PER_TRACK)
+        pairs.extend(candidates)
+    print(f"  [{tag}] positive pairs: {len(pairs)}")
+    return pairs
+
+
+def build_negative_pairs(by_frame, crop_lookup, tag):
+    rng = random.Random(RANDOM_SEED)
+    pairs = []
+    for fidx, entries in by_frame.items():
+        tids_here = [tid for tid, _, _ in entries]
+        if len(tids_here) < 2:
+            continue
+        possible = []
+        for i in range(len(tids_here)):
+            for j in range(i + 1, len(tids_here)):
+                key_i = (tids_here[i], fidx)
+                key_j = (tids_here[j], fidx)
+                if key_i in crop_lookup and key_j in crop_lookup:
+                    possible.append((crop_lookup[key_i]["path"], crop_lookup[key_j]["path"]))
+        if len(possible) > MAX_NEGATIVES_PER_FRAME:
+            possible = rng.sample(possible, MAX_NEGATIVES_PER_FRAME)
+        pairs.extend(possible)
+    print(f"  [{tag}] negative pairs: {len(pairs)}")
+    return pairs
+
+
+def main():
+    all_positive = []
+    all_negative = []
+
+    for src in SOURCES:
+        tag = src["tag"]
+        video_path = os.path.join(PROJECT_DIR, src["video"])
+        json_path = os.path.join(PROJECT_DIR, src["json"])
+        print(f"processing {tag} ({src['video']})...")
+
+        by_frame, by_track = load_real_detections(json_path)
+        out_dir = os.path.join(CROPS_DIR, tag)
+        crop_lookup = extract_crops(tag, video_path, by_frame, out_dir)
+
+        pos = build_positive_pairs(by_track, crop_lookup, tag)
+        neg = build_negative_pairs(by_frame, crop_lookup, tag)
+        all_positive.extend(pos)
+        all_negative.extend(neg)
+
+    os.makedirs(os.path.dirname(MANIFEST_PATH), exist_ok=True)
+    with open(MANIFEST_PATH, "w") as f:
+        json.dump({"positive": all_positive, "negative": all_negative}, f)
+
+    print()
+    print(f"TOTAL positive pairs: {len(all_positive)}")
+    print(f"TOTAL negative pairs: {len(all_negative)}")
+    print(f"manifest written to {MANIFEST_PATH}")
