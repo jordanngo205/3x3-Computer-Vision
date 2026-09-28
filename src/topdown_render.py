@@ -148,6 +148,9 @@ def main():
     p.add_argument("--save-positions", default=None)
     p.add_argument("--smooth-seconds", type=float, default=0.25,
                    help="window for smoothing court positions along a track")
+    p.add_argument("--fill-seconds", type=float, default=0.25,
+                   help="interpolate a player across dropouts up to this long, so brief detection "
+                        "misses do not read as the dot flickering")
     p.add_argument("--no-track-vote", action="store_true",
                    help="keep the per-frame kit call instead of settling each track on one kit")
     p.add_argument("--all-cameras", action="store_true",
@@ -292,6 +295,32 @@ def main():
             sy = np.convolve(np.pad(ys, pad, mode="edge"), k, mode="valid")[:len(ys)]
             for (f, d), a, b in zip(seq, sx, sy):
                 d["cx"], d["cy"] = float(a), float(b)
+
+    # Fill brief dropouts. A player missed for a frame or two reads as the dot
+    # flickering; interpolating between two real observations is safe because it
+    # is anchored at both ends. Long gaps are left empty rather than invented.
+    if args.fill_seconds > 0:
+        max_gap = max(1, int(round(args.fill_seconds * fps)))
+        seqs = {}
+        for f, ds in detections.items():
+            for d in ds:
+                seqs.setdefault(d.get("tid"), []).append((f, d))
+        for tid, seq in seqs.items():
+            seq.sort(key=lambda t: t[0])
+            for (fa, da), (fb, db) in zip(seq, seq[1:]):
+                gap = fb - fa
+                if not (1 < gap <= max_gap):
+                    continue
+                dist = ((db["cx"] - da["cx"]) ** 2 + (db["cy"] - da["cy"]) ** 2) ** 0.5
+                if dist > 40 * gap:          # implausible travel: do not invent it
+                    continue
+                for g in range(1, gap):
+                    t = g / gap
+                    detections.setdefault(fa + g, []).append({
+                        "cx": da["cx"] + (db["cx"] - da["cx"]) * t,
+                        "cy": da["cy"] + (db["cy"] - da["cy"]) * t,
+                        "kp": da["kp"], "pt": da["pt"], "box": da["box"],
+                        "feat": da.get("feat"), "tid": tid, "filled": True})
 
     # settle each track on one kit by voting its per-frame calls: a single
     # frame's torso patch is far too noisy to trust on its own
