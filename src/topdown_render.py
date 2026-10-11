@@ -334,10 +334,12 @@ def main():
                    help="use the old box-overlap linker instead of BoT-SORT")
     p.add_argument("--keep-referees", action="store_true",
                    help="keep officials in the output instead of filtering them out")
-    p.add_argument("--max-depth", type=float, default=1000.0,
-                   help="drop detections deeper than this many cm from the baseline. From 180 hand "
-                        "labels: every bench/substitute detection sat beyond 1000 cm, and only one "
-                        "player in 129 ever did, so this removes the bench without losing players.")
+    p.add_argument("--max-depth", type=float, default=900.0,
+                   help="drop detections deeper than this many cm from the baseline. Re-derived from "
+                        "the 180 hand labels after the per-frame homography fixed the positions they "
+                        "were measured in: 900 cm keeps 97.7 pct of players and removes all of the "
+                        "bench. The old 1000 cm cut was fitted to positions that were 180-300 cm "
+                        "wrong, and under correct geometry it lets 1 bench detection in 10 through.")
     p.add_argument("--bounds-margin", type=float, default=60.0,
                    help="centimetres of slack outside the court lines; players step over them")
     args = p.parse_args()
