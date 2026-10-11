@@ -139,3 +139,119 @@ def snap_to_lines(frame, H_init, iters=30, step0=6.0):
             if step < 0.4:
                 break
     return best_H, best_c
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--video", required=True)
+    p.add_argument("--calib", required=True, help="clicked calibration for the reference frame")
+    p.add_argument("--ref-frame", type=int, required=True,
+                   help="the frame the calibration was clicked on")
+    p.add_argument("--out", required=True, help="pickle of per-frame homographies")
+    p.add_argument("--segments", default=None,
+                   help="json list of [start,end] frame ranges on the calibrated camera")
+    p.add_argument("--scale", type=float, default=0.5, help="tracking resolution")
+    p.add_argument("--min-points", type=int, default=120,
+                   help="re-detect floor features when fewer than this survive")
+    p.add_argument("--reanchor-every", type=int, default=25,
+                   help="snap to the painted lines this often, to kill chain drift")
+    p.add_argument("--no-reanchor", action="store_true")
+    args = p.parse_args()
+
+    H_ref = np.array(json.load(open(args.calib))["H_image_to_court"])
+    S = np.diag([args.scale, args.scale, 1.0])
+    Sinv = np.linalg.inv(S)
+
+    segs = json.load(open(args.segments)) if args.segments else None
+
+    cap = cv2.VideoCapture(args.video)
+    frames = []
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        frames.append(f)
+    cap.release()
+    n = len(frames)
+    print(f"{n} frames")
+
+    def in_seg(i):
+        return segs is None or any(a <= i < b for a, b in segs)
+
+    lk = dict(winSize=(21, 21), maxLevel=4,
+              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+
+    def small(i):
+        return cv2.cvtColor(cv2.resize(frames[i], None, fx=args.scale, fy=args.scale),
+                            cv2.COLOR_BGR2GRAY)
+
+    def detect(i):
+        g = small(i)
+        m = cv2.resize(floor_mask(frames[i]), (g.shape[1], g.shape[0]))
+        pts = cv2.goodFeaturesToTrack(g, maxCorners=1200, qualityLevel=0.01,
+                                      minDistance=7, mask=(m > 0).astype(np.uint8))
+        return g, (pts if pts is not None else np.empty((0, 1, 2), np.float32))
+
+    out = {}
+    for direction in (1, -1):
+        H_c2r = np.eye(3)                      # current frame -> reference frame, full res
+        prev_g, prev_pts = detect(args.ref_frame)
+        i = args.ref_frame
+        if direction == 1:
+            out[i] = H_ref.copy()
+        since_anchor = 0
+        while True:
+            j = i + direction
+            if not (0 <= j < n):
+                break
+            if not in_seg(j):
+                i = j
+                continue
+            g = small(j)
+            if len(prev_pts) < args.min_points:
+                prev_g, prev_pts = detect(i)
+            if len(prev_pts) >= 12:
+                nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_g, g, prev_pts, None, **lk)
+                back, st2, _ = cv2.calcOpticalFlowPyrLK(g, prev_g, nxt, None, **lk)
+                fb = np.linalg.norm(prev_pts - back, axis=2).ravel()
+                keep = (st.ravel() == 1) & (st2.ravel() == 1) & (fb < 1.5)
+                a, b = prev_pts[keep], nxt[keep]
+                if len(a) >= 12:
+                    Hs, inl = cv2.findHomography(b, a, cv2.RANSAC, 2.0)
+                    if Hs is not None and inl is not None and inl.sum() >= 10:
+                        H_step = Sinv @ Hs @ S        # frame j -> frame i, full res
+                        H_c2r = H_c2r @ H_step
+                        prev_g, prev_pts = g, b[inl.ravel() == 1]
+                    else:
+                        prev_g, prev_pts = detect(j)
+                else:
+                    prev_g, prev_pts = detect(j)
+            else:
+                prev_g, prev_pts = detect(j)
+
+            H = H_ref @ H_c2r
+            since_anchor += 1
+            if not args.no_reanchor and since_anchor >= args.reanchor_every:
+                snapped, _ = snap_to_lines(frames[j], H)
+                if snapped is not None:
+                    H = snapped
+                    H_c2r = np.linalg.inv(H_ref) @ H   # fold the correction back in
+                since_anchor = 0
+                prev_g, prev_pts = detect(j)
+            out[j] = H
+            i = j
+            if len(out) % 200 == 0:
+                print(f"  {len(out)} frames registered", flush=True)
+
+    pickle.dump({k: v.tolist() for k, v in out.items()}, open(args.out, "wb"))
+    print(f"wrote {len(out)} per-frame homographies -> {args.out}")
+
+    check = sorted(out)[::max(1, len(out) // 15)]
+    print(f"\n{'frame':>6} {'fixed':>7} {'per-frame':>10}")
+    fa, pa = [], []
+    for f in check:
+        lm = line_mask(frames[f])
+        a, b = alignment(lm, H_ref), alignment(lm, np.array(out[f]))
+        fa.append(a); pa.append(b)
+        print(f"{f:6d} {a:7.3f} {b:10.3f}")
+    print(f"\nmean alignment  fixed {np.mean(fa):.3f}  per-frame {np.mean(pa):.3f}")
