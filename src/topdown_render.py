@@ -287,6 +287,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--video", required=True)
     p.add_argument("--calib", default="court_calibration.json")
+    p.add_argument("--homographies", default=None,
+                   help="pickle of per-frame homographies from stabilize_court.py. The broadcast "
+                        "camera pans, so a single clicked calibration is only true for the frame it "
+                        "was clicked on - measured, a fixed patch of floor moves up to 415 px across "
+                        "one camera shot, which is 180-300 cm of court error.")
     p.add_argument("--out", default="topdown.mp4")
     p.add_argument("--model", default="yolo11m-pose.pt")
     p.add_argument("--conf", type=float, default=0.25)
@@ -338,6 +343,11 @@ def main():
     args = p.parse_args()
 
     H = np.array(json.load(open(args.calib))["H_image_to_court"])
+    per_frame_H = None
+    if args.homographies:
+        with open(args.homographies, "rb") as fh:
+            per_frame_H = {int(k): np.array(v) for k, v in pickle.load(fh).items()}
+        print(f"per-frame homographies for {len(per_frame_H)} frames from {args.homographies}")
     model = YOLO(args.model)
 
     # The calibration belongs to one camera. Broadcast clips cut to zoomed and
@@ -354,8 +364,9 @@ def main():
         print(f"camera shots: {len(shots)} total, {len(wide)} match the calibrated view "
               f"({skipped} frames from other cameras will be skipped)")
 
-    def to_court(pt):
-        return cv2.perspectiveTransform(np.array([[pt]], dtype=np.float32), H).reshape(2)
+    def to_court(pt, Hf=None):
+        Hc = H if Hf is None else Hf
+        return cv2.perspectiveTransform(np.array([[pt]], dtype=np.float32), Hc).reshape(2)
 
     def box_iou(a, b):
         x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
@@ -403,6 +414,13 @@ def main():
             detections[fi] = []
             fi += 1
             continue
+        Hf = None
+        if per_frame_H is not None:
+            Hf = per_frame_H.get(fi)
+            if Hf is None:          # unregistered frame: no reliable court mapping
+                detections[fi] = []
+                fi += 1
+                continue
         if args.greedy_link:
             res = model(frame, conf=args.conf, iou=0.85, imgsz=args.imgsz,
                         device=args.device, verbose=False)[0]
@@ -424,7 +442,7 @@ def main():
             pt = ankle_point(kps[i], box)
             if pt is None:
                 continue
-            cx, cy = to_court(pt)
+            cx, cy = to_court(pt, Hf)
             # in/out of bounds is now decided in court metres, not by a pixel
             # polygon: a substitute sitting past the sideline is genuinely off
             # the court, whatever the floor looks like there
