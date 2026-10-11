@@ -35,6 +35,13 @@ into court centimetres (FIBA 3x3 is a 1500x1100 cm half court with a single bask
 Each clip needs its own calibration: the camera framing differs between clips, and
 using the wrong one silently places bench players on court.
 
+**One homography per frame** — the broadcast camera pans, so a clicked calibration is
+only true for the frame it was clicked on. A fixed patch of floor moves up to 415 px
+across what shot detection calls a single camera, which is 180-300 cm of court error.
+`stabilize_court.py` keeps the clicked calibration as an anchor and carries it to every
+frame by tracking floor points with KLT, re-anchoring on the painted lines every 25
+frames to kill the chain's drift. Court alignment across the clip: 0.278 -> 0.778.
+
 **Non-players** — decided in court metres rather than by a pixel polygon. A substitute
 sitting past the sideline is genuinely off the court whatever the floor looks like
 there. Referees are removed by a low-saturation, low-value torso test.
@@ -62,12 +69,20 @@ Measured on the clip above:
 | greedy box-overlap linking, per-frame kit | 89 | 37 | 9 | 80% |
 | BoT-SORT + merging + per-track kit | 57 | 7 | **1** | **90%** |
 
+Fixing the homography then moved the detection side, because positions decide who
+counts as on court:
+
+| | frames with all 6 | missing players/frame | referees removed |
+|---|---|---|---|
+| one fixed homography | 905 | 0.51 | 403 |
+| one homography per frame | **1082** | **0.29** | 694 |
+
 **On the metrics.** A track that changes kit mid-life is provably wrong — one person
 wears one kit — so that number should be zero, and it is the honest measure. The 3/3
 rate is reported as a *consequence*, not a target: an earlier version forced three red
 and three white in every six-player frame, which made its "100% correct" meaningless.
 
-**Open problems.** All six players are detected in roughly half of frames; the rest
+**Open problems.** All six players are detected in 1082 of 1824 frames; the rest
 lose someone to occlusion. Telling two team-mates apart is unsolved here and in the
 published state of the art — TrackID3x3 (arXiv:2503.18282) states its own baseline
 "cannot handle ID exchanges between players". Ball detection is not implemented.
@@ -86,6 +101,10 @@ Kept here because they cost real time:
   frames" positives were near-duplicate images the model matched on pose and background.
 - **Aspect-ratio and two-skeleton filters** deleted real players — lunging players and
   players standing beside a team-mate.
+- **Registering frames with ORB descriptors** to fix the camera pan. The floor is a
+  large plain grey surface, so matching to a distant frame returned the identity
+  transform with 570 confident inliers. Matching on the background instead aligns the
+  wrong plane — the stands are not the ground. KLT between consecutive frames works.
 
 ## Running it
 
@@ -127,6 +146,7 @@ The pipeline that produces the render above:
 | `src/pose_detect.py` | detection with skeletons, automatic court-region detection |
 | `src/track_botsort.py` | camera-shot detection, team-colour helpers |
 | `src/calibrate_court.py` | click tool for the four calibration points |
+| `src/stabilize_court.py` | one homography per frame, by KLT propagation + line re-anchoring |
 | `court_calibration_long.json` | homography for `Canada v Ger Long.mov` |
 
 Calibration and court geometry:

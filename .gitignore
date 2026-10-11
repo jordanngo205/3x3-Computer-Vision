@@ -32,3 +32,5 @@ tesi.pdf
 # scratch
 src/scratch_crops/
 *.bak
+
+homographies_*.pkl
