@@ -91,3 +91,51 @@ def alignment(frame_line_mask, H_img2court):
         return 0.0
     fat = cv2.dilate(frame_line_mask, np.ones((7, 7), np.uint8))
     return float(fat[p[inside, 1].astype(int), p[inside, 0].astype(int)].mean())
+
+
+def h_from_anchors(img_pts):
+    """Homography image->court from where the four court corners sit in the image."""
+    H, _ = cv2.findHomography(np.asarray(img_pts, np.float32), ANCHORS)
+    return H
+
+
+def snap_to_lines(frame, H_init, iters=30, step0=6.0):
+    """Re-anchor on the painted lines.
+
+    Optimising the raw matrix entries does not converge - they differ by orders
+    of magnitude. Moving the four court corners around in the image is the same
+    eight degrees of freedom in units the optimiser can handle.
+    """
+    lm = line_mask(frame)
+    dt = cv2.distanceTransform((1 - lm).astype(np.uint8), cv2.DIST_L2, 3)
+    h, w = dt.shape
+
+    def cost(H):
+        p = cv2.perspectiveTransform(MODEL, np.linalg.inv(H)).reshape(-1, 2)
+        xi = np.clip(p[:, 0], 0, w - 1).astype(int)
+        yi = np.clip(p[:, 1], 0, h - 1).astype(int)
+        d = dt[yi, xi].copy()
+        off = (p[:, 0] < 0) | (p[:, 0] >= w) | (p[:, 1] < 0) | (p[:, 1] >= h)
+        d[off] = 80.0
+        return float(np.mean(np.minimum(d, 80.0)))
+
+    cur = cv2.perspectiveTransform(ANCHORS.reshape(-1, 1, 2),
+                                   np.linalg.inv(H_init)).reshape(-1, 2)
+    best_H, best_c, step = H_init, cost(H_init), step0
+    for _ in range(iters):
+        improved = False
+        for i in range(4):
+            for dx, dy in ((step, 0), (-step, 0), (0, step), (0, -step)):
+                trial = cur.copy()
+                trial[i] += (dx, dy)
+                H = h_from_anchors(trial)
+                if H is None:
+                    continue
+                c = cost(H)
+                if c < best_c - 1e-4:
+                    best_c, best_H, cur, improved = c, H, trial, True
+        if not improved:
+            step /= 2.0
+            if step < 0.4:
+                break
+    return best_H, best_c
