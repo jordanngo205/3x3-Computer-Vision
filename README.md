@@ -72,10 +72,16 @@ Measured on the clip above:
 Fixing the homography then moved the detection side, because positions decide who
 counts as on court:
 
-| | frames with all 6 | missing players/frame | referees removed |
+| | all six found | missing someone | too many |
 |---|---|---|---|
-| one fixed homography | 905 | 0.51 | 403 |
-| one homography per frame | **1082** | **0.29** | 694 |
+| fixed homography, yolo11m @ 1280 | 49.6% | 38.6% | 11.7% |
+| per-frame homography, yolo11m @ 1280 | 59.4% | 24.7% | 16.0% |
+| per-frame homography, yolo11x @ 1600 | **66.7%** | **23.4%** | **10.0%** |
+
+The detector choice could not be judged until the homography was fixed: the earlier
+comparison used positions that were 180-300 cm wrong to decide who was on court, and
+it ranked yolo11x @ 1600 no better than the default. Re-measured on correct positions
+it cuts the missing-player rate from 34.8% to 15.2% on the sampled frames.
 
 **On the metrics.** A track that changes kit mid-life is provably wrong — one person
 wears one kit — so that number should be zero, and it is the honest measure. The 3/3
@@ -158,6 +164,11 @@ Calibration and court geometry:
 | `src/auto_calibrate.py` | attempt calibration from detected court lines |
 | `src/validate_calibration.py` | reproject known points to check a calibration |
 | `labels_canger.txt` | 180 hand labels (player / referee / other) behind the depth cut |
+
+The depth cut that removes the bench was re-derived after the homography was fixed.
+The labels record court positions, so correcting the homography moved them: 900 cm now
+keeps 97.7 pct of players and removes every bench detection, where the old 1000 cm cut
+lets one in ten through.
 
 Earlier tracker iterations, kept because the README's results are measured against
 them. `track_clip7.py` is the hand-tuned v7 baseline the current pipeline replaced:
