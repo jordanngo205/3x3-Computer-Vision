@@ -82,12 +82,18 @@ def floor_mask(frame):
     return ((lab == big).astype(np.uint8)) * 255
 
 
-def alignment(frame_line_mask, H_img2court):
-    """Fraction of the projected court model that lands on a painted line."""
+def alignment(frame_line_mask, H_img2court, min_cover=0.35):
+    """Fraction of the projected court model that lands on a painted line.
+
+    Scored only over the model points that fall inside the frame, so a
+    homography that squeezes the court into a corner could otherwise score
+    near 1.0 on a handful of pixels - that artefact had me briefly believe a
+    degenerate fit was the best one. Below min_cover the score is refused.
+    """
     h, w = frame_line_mask.shape
     p = cv2.perspectiveTransform(MODEL, np.linalg.inv(H_img2court)).reshape(-1, 2)
     inside = (p[:, 0] >= 0) & (p[:, 0] < w) & (p[:, 1] >= 0) & (p[:, 1] < h)
-    if inside.sum() < 100:
+    if inside.sum() < 100 or inside.mean() < min_cover:
         return 0.0
     fat = cv2.dilate(frame_line_mask, np.ones((7, 7), np.uint8))
     return float(fat[p[inside, 1].astype(int), p[inside, 0].astype(int)].mean())
@@ -164,16 +170,30 @@ def main():
 
     segs = json.load(open(args.segments)) if args.segments else None
 
+    # Keep only what tracking needs in memory. Holding every frame at full
+    # colour is 2305 x 1984x1112x3 = about 15 GB, which drove the machine into
+    # swap; the half-resolution grey frames KLT actually uses are ~1.3 GB, and
+    # the few colour frames the line re-anchoring needs are re-read on demand.
     cap = cv2.VideoCapture(args.video)
-    frames = []
+    grey = []
     while True:
         ok, f = cap.read()
         if not ok:
             break
-        frames.append(f)
+        grey.append(cv2.cvtColor(cv2.resize(f, None, fx=args.scale, fy=args.scale),
+                                 cv2.COLOR_BGR2GRAY))
     cap.release()
-    n = len(frames)
-    print(f"{n} frames")
+    n = len(grey)
+    mb = sum(g.nbytes for g in grey) / 1e6
+    print(f"{n} frames, {mb:.0f} MB of half-resolution grey held for tracking")
+
+    _colour_cap = cv2.VideoCapture(args.video)
+
+    def colour(i):
+        """Re-read one frame in colour, for the masks that need it."""
+        _colour_cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ok, f = _colour_cap.read()
+        return f if ok else None
 
     def in_seg(i):
         return segs is None or any(a <= i < b for a, b in segs)
@@ -182,12 +202,14 @@ def main():
               criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
     def small(i):
-        return cv2.cvtColor(cv2.resize(frames[i], None, fx=args.scale, fy=args.scale),
-                            cv2.COLOR_BGR2GRAY)
+        return grey[i]
 
     def detect(i):
         g = small(i)
-        m = cv2.resize(floor_mask(frames[i]), (g.shape[1], g.shape[0]))
+        c = colour(i)
+        if c is None:
+            return g, np.empty((0, 1, 2), np.float32)
+        m = cv2.resize(floor_mask(c), (g.shape[1], g.shape[0]))
         pts = cv2.goodFeaturesToTrack(g, maxCorners=1200, qualityLevel=0.01,
                                       minDistance=7, mask=(m > 0).astype(np.uint8))
         return g, (pts if pts is not None else np.empty((0, 1, 2), np.float32))
@@ -232,7 +254,8 @@ def main():
             H = H_ref @ H_c2r
             since_anchor += 1
             if not args.no_reanchor and since_anchor >= args.reanchor_every:
-                snapped, _ = snap_to_lines(frames[j], H)
+                cj = colour(j)
+                snapped, _ = (snap_to_lines(cj, H) if cj is not None else (None, None))
                 if snapped is not None:
                     H = snapped
                     H_c2r = np.linalg.inv(H_ref) @ H   # fold the correction back in
@@ -250,8 +273,15 @@ def main():
     print(f"\n{'frame':>6} {'fixed':>7} {'per-frame':>10}")
     fa, pa = [], []
     for f in check:
-        lm = line_mask(frames[f])
+        cf = colour(f)
+        if cf is None:
+            continue
+        lm = line_mask(cf)
         a, b = alignment(lm, H_ref), alignment(lm, np.array(out[f]))
         fa.append(a); pa.append(b)
         print(f"{f:6d} {a:7.3f} {b:10.3f}")
     print(f"\nmean alignment  fixed {np.mean(fa):.3f}  per-frame {np.mean(pa):.3f}")
+
+
+if __name__ == "__main__":
+    main()
