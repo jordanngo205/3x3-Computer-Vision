@@ -72,11 +72,21 @@ Measured on the clip above:
 Fixing the homography then moved the detection side, because positions decide who
 counts as on court:
 
-| | all six found | missing someone | too many |
-|---|---|---|---|
-| fixed homography, yolo11m @ 1280 | 49.6% | 38.6% | 11.7% |
-| per-frame homography, yolo11m @ 1280 | 59.4% | 24.7% | 16.0% |
-| per-frame homography, yolo11x @ 1600 | **66.7%** | **23.4%** | **10.0%** |
+| | all six found | missing someone | too many | team correct |
+|---|---|---|---|---|
+| fixed homography, yolo11m @ 1280 | 49.6% | 38.6% | 11.7% | — |
+| per-frame homography, yolo11x @ 1600 | 66.7% | 23.4% | 10.0% | 93.3% |
+| + camera-cut reset, wider dropout fill | 71.2% | 13.9% | 15.0% | 95.5% |
+| + roster guard on the fill | **81.0%** | **13.9%** | **5.1%** | **94.0%** |
+
+**Team accuracy is measured, not inferred.** 135 detections across 24 frames were hand
+labelled red / white / referee / non-player, and the pipeline is scored against them by
+matching on court position. The last two rows differ by two detections out of 134,
+which is noise at this sample size; the roster guard is kept for the ten points of
+completeness it buys.
+
+With the original fixed homography, 103 of those 135 labelled players had no detection
+within a metre of where they actually were. That is the size of the camera-pan error.
 
 The detector choice could not be judged until the homography was fixed: the earlier
 comparison used positions that were 180-300 cm wrong to decide who was on court, and
@@ -107,6 +117,11 @@ Kept here because they cost real time:
   frames" positives were near-duplicate images the model matched on pose and background.
 - **Aspect-ratio and two-skeleton filters** deleted real players — lunging players and
   players standing beside a team-mate.
+- **Re-clicking the calibration with points spread corner to corner.** It scored 0.567
+  against the original four key corners' 0.779, with 24 frames below 0.4 against one.
+  The clicks were accurate to 15 px, but near the far baseline one pixel is 3-4 cm of
+  court, against about 1 cm near the key, so a good click there still lands half a
+  metre out and behind the baseline. Wide spread helps only where the pixels are dense.
 - **Registering frames with ORB descriptors** to fix the camera pan. The floor is a
   large plain grey surface, so matching to a distant frame returned the identity
   transform with 570 confident inliers. Matching on the background instead aligns the
