@@ -132,7 +132,7 @@ def team_of(frame, box):
 
 
 def merge_fragments(detections, fps, max_gap_seconds=0.4, max_dist_cm=300.0,
-                    max_speed_cms=900.0):
+                    max_speed_cms=900.0, forbid=None):
     """Rejoin the tracks that are one player broken in two.
 
     BoT-SORT opens a new id when a player is occluded and reappears: on this
@@ -183,6 +183,8 @@ def merge_fragments(detections, fps, max_gap_seconds=0.4, max_dist_cm=300.0,
             dist = ((pa[0]-pb[0])**2 + (pa[1]-pb[1])**2) ** 0.5
             if dist > max_dist_cm or dist > max_speed_cms * gap / fps:
                 continue
+            if forbid is not None and forbid(span[a][1], span[b][0]):
+                continue                      # the gap spans a camera cut
             cands.append((dist, gap, a, b))
     cands.sort()
 
@@ -229,10 +231,13 @@ def assign_teams_global(detections, split, lam_scale=1.0, iters=40):
     Colour decides the tracks it can see clearly; the 3/3 rule decides the ones
     it cannot.
     """
+    # Interpolated points carry a copy of a real detection's colour score, so
+    # counting them would let one observation vote many times and drown the
+    # track's genuine evidence. They still take the label the track is given.
     tracks = {}
     for f, ds in detections.items():
         for d in ds:
-            if d.get("feat") is not None and d.get("tid") is not None:
+            if d.get("feat") is not None and d.get("tid") is not None and not d.get("filled"):
                 tracks.setdefault(d["tid"], []).append(d["feat"])
     if not tracks:
         return {}
@@ -299,9 +304,15 @@ def main():
     p.add_argument("--save-positions", default=None)
     p.add_argument("--smooth-seconds", type=float, default=0.25,
                    help="window for smoothing court positions along a track")
-    p.add_argument("--fill-seconds", type=float, default=0.25,
-                   help="interpolate a player across dropouts up to this long, so brief detection "
-                        "misses do not read as the dot flickering")
+    p.add_argument("--fill-seconds", type=float, default=0.5,
+                   help="interpolate a player across dropouts up to this long. The old 0.25 s was "
+                        "sized for 30 fps; this clip averages 43, so the window was 11 frames while "
+                        "the median dropout is 15 and only 11 pct of gaps were reachable. 0.5 s "
+                        "reaches about three quarters of them.")
+    p.add_argument("--max-speed-cms", type=float, default=900.0,
+                   help="reject an interpolation implying a player ran faster than this (cm/s). "
+                        "900 is about 9 m/s, near a sprinter's peak, so anything above it is two "
+                        "different people rather than one fast one.")
     p.add_argument("--no-track-vote", action="store_true",
                    help="keep the per-frame kit call instead of settling each track on one kit")
     p.add_argument("--all-cameras", action="store_true",
@@ -366,6 +377,18 @@ def main():
         print(f"camera shots: {len(shots)} total, {len(wide)} match the calibrated view "
               f"({skipped} frames from other cameras will be skipped)")
 
+    # Camera cuts are not dropouts. A track must not be carried across one:
+    # the frames between belong to another camera and were never tracked.
+    cut_points = []
+    if wide_frames:
+        ws = sorted(wide_frames)
+        for a, b in zip(ws, ws[1:]):
+            if b - a > 1:
+                cut_points.append((a, b))
+
+    def crosses_cut(fa, fb):
+        return any(fa <= a and b <= fb for a, b in cut_points)
+
     def to_court(pt, Hf=None):
         Hc = H if Hf is None else Hf
         return cv2.perspectiveTransform(np.array([[pt]], dtype=np.float32), Hc).reshape(2)
@@ -393,6 +416,8 @@ def main():
     # is why the labels were flickering between red and white
     tracks, votes, next_id = {}, {}, 0
     n_refs = [0]
+    n_cuts = [0]
+    pending_cut = False
     detections = {}
 
     cache = args.cache_detections
@@ -415,7 +440,24 @@ def main():
         if wide_frames is not None and fi not in wide_frames:
             detections[fi] = []
             fi += 1
+            pending_cut = True
             continue
+        if pending_cut and not args.greedy_link:
+            # A camera cut is a different view, not an occlusion. Without this
+            # the tracker never sees the discontinuity - those frames are
+            # skipped - so it hands a player's id to whoever is nearest after
+            # the cut. One labelled track did exactly that across the cut at
+            # frames 1545-1981. Keep the global counter so ids stay unique.
+            try:
+                from ultralytics.trackers.basetrack import BaseTrack
+                for tr in getattr(model.predictor, "trackers", []):
+                    keep = BaseTrack._count
+                    tr.reset()
+                    BaseTrack._count = keep
+                n_cuts[0] += 1
+            except Exception as exc:
+                print(f"  could not reset tracker at frame {fi}: {exc}")
+        pending_cut = False
         Hf = None
         if per_frame_H is not None:
             Hf = per_frame_H.get(fi)
@@ -505,7 +547,8 @@ def main():
         print(f"cached detections -> {cache}")
 
     if not args.no_merge_fragments:
-        merge_fragments(detections, fps, args.merge_gap_seconds, args.merge_dist_cm)
+        merge_fragments(detections, fps, args.merge_gap_seconds, args.merge_dist_cm,
+                        forbid=crosses_cut)
 
     # smooth each track's court position over a short window. A single frame's
     # ankle keypoints jitter by a few pixels, and the homography turns that into
@@ -568,9 +611,18 @@ def main():
                 if not (1 < gap <= max_gap):
                     continue
                 dist = ((db["cx"] - da["cx"]) ** 2 + (db["cy"] - da["cy"]) ** 2) ** 0.5
-                if dist > 40 * gap:          # implausible travel: do not invent it
+                # judge the speed, not a per-frame pixel budget: the old
+                # 40 cm/frame rule meant 17 m/s at this clip's frame rate
+                if dist > args.max_speed_cms * gap / fps:
+                    continue
+                if crosses_cut(fa, fb):      # a cut is a different camera, not a dropout
                     continue
                 for g in range(1, gap):
+                    # the roster is the point of the fill: six players exist, so
+                    # a frame already holding six needs no one invented. Without
+                    # this the fill pushed over-counted frames from 10% to 15%.
+                    if len(detections.get(fa + g, [])) >= 6:
+                        continue
                     t = g / gap
                     detections.setdefault(fa + g, []).append({
                         "cx": da["cx"] + (db["cx"] - da["cx"]) * t,
@@ -584,7 +636,7 @@ def main():
     by_track = {}
     for f, ds in detections.items():
         for d in ds:
-            if d.get("feat") is not None:
+            if d.get("feat") is not None and not d.get("filled"):
                 by_track.setdefault(d.get("tid"), []).append((f, d))
     for tid, seq in by_track.items():
         seq.sort(key=lambda t: t[0])
@@ -676,6 +728,8 @@ def main():
     cap.release()
     writer.release()
     print(f"referee detections removed: {n_refs[0]}")
+    if n_cuts[0]:
+        print(f"tracker reset at {n_cuts[0]} camera cuts")
     print(f"done. {fi} frames -> {args.out}   {on_court_total/max(1,fi):.1f} players/frame")
     if args.save_positions:
         json.dump({"fps": fps, "court_cm": [COURT_W, COURT_H], "frames": positions},
