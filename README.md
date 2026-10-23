@@ -3,8 +3,9 @@
 Player detection, tracking and team assignment on FIBA 3x3 broadcast footage, with
 positions projected onto a calibrated top-down court in real centimetres.
 
-`TOPDOWN_LONG11.mp4` is the output: the broadcast on the left, the court model on the
-right, one dot per player in their kit colour.
+`TOPDOWN_LONG16_small.mp4` is the output: the broadcast on the left, the court model on
+the right, one dot per player in their kit colour. It is a compressed preview so it
+plays in the browser; the pipeline writes a 128 MB full-resolution render.
 
 Clip: Canada v Germany, FIBA 3x3 Women's Series quarter-final. 1984x1112, variable
 frame rate (~43 fps average), 52.9 seconds.
@@ -23,9 +24,10 @@ Detecting people is easy. The hard parts, in the order they bit:
 
 ## How it works
 
-**Detection** — YOLO11 pose (`yolo11m-pose`) at `imgsz=1280`, NMS IoU `0.85`. The
-default IoU of 0.70 suppresses a player standing behind another as a duplicate.
-17 COCO keypoints per player.
+**Detection** — YOLO11 pose at NMS IoU `0.85`; the default IoU of 0.70 suppresses a
+player standing behind another as a duplicate. 17 COCO keypoints per player. The render
+above uses `yolo11x-pose` at `imgsz=1600`, which cuts the missing-player rate from 34.8%
+to 15.2% against `yolo11m-pose` at 1280 (still the script's default, and 3x faster).
 
 **Ground contact** — the ankle keypoints, not the bottom of the box. The box bottom
 drifts with pose and motion blur; the ankles are where the player touches the floor.
@@ -141,20 +143,34 @@ free-throw right, free-throw left):
 .venv/bin/python src/calibrate_court.py --video "clip.mov" --out court_calibration_long.json
 ```
 
+The camera pans, so carry that calibration to every frame (writes one homography per
+frame; `--ref-frame` is the frame the calibration was clicked on):
+
+```bash
+.venv/bin/python src/stabilize_court.py \
+  --video "Canada v Ger Long.mov" \
+  --calib court_calibration_long.json \
+  --ref-frame 60 \
+  --out homographies_long.pkl
+```
+
 Then render:
 
 ```bash
 .venv/bin/python src/topdown_render.py \
   --video "Canada v Ger Long.mov" \
   --calib court_calibration_long.json \
+  --homographies homographies_long.pkl \
+  --model yolo11x-pose.pt --imgsz 1600 \
+  --device mps \
   --cache-detections cache_long.pkl \
-  --out TOPDOWN_LONG11.mp4 \
-  --save-positions positions_long11.json
+  --out TOPDOWN_LONG16.mp4 \
+  --save-positions positions_long16.json
 ```
 
 `--cache-detections` is worth using. Detection and tracking are the whole cost and do
 not depend on the team logic, so caching them turns an hour-long experiment on the
-labelling into a one-second one. Add `--device mps` on Apple Silicon — ultralytics
+labelling into a one-second one. `--device mps` matters on Apple Silicon — ultralytics
 otherwise selects CPU, which is about 2.5x slower.
 
 ## Files
@@ -214,5 +230,6 @@ Analysis built on the tracked positions:
 | `src/project_events.py`, `src/render_shot_chart.py` | events to court coordinates, shot chart |
 | `src/app.py`, `src/video_library.py` | local review app for tagging clips |
 
-Source footage and model weights are not in the repo. `yolo11m-pose.pt` is downloaded
-automatically by ultralytics on first run.
+Source footage and model weights are not in the repo. The pose weights are downloaded
+automatically by ultralytics on first run. `homographies_long.pkl` is derived too — regenerate it with the
+stabilization step above.
