@@ -1,7 +1,6 @@
 # Source footage and model weights: large, re-downloadable, or not ours to publish
 *.mov
 *.mp4
-!TOPDOWN_LONG11.mp4
 *.pt
 *.onnx
 
@@ -13,6 +12,7 @@ video_*.mp4
 clip01_*
 realtest_*
 *_small.mp4
+!TOPDOWN_LONG16_small.mp4
 cache_*.pkl
 *.pkl
 review_images/
